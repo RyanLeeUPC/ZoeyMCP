@@ -12,7 +12,7 @@ and only an accepted one is sent. S13/S14's failure matrix through the gateway (
 after the dot, a proxy stripping STARTTLS) and S14's direct case stay unit rows
 (``test_smtp_connector.py``) until the pre-main test-debt pass. S16: the example records
 toolkit's batches against the records API over real TLS. Then the H14 sweep over everything
-recorded.
+recorded. In each, the agent offers sampling and roots, and neither is ever called (M.1, D-75).
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import httpx
 import pytest
 from mcp.types import CallToolResult, TextContent
 
-from tests.fakes.agent import ACCEPT, DECLINE, VERSIONS, Answer, Script, Version, agent
+from tests.fakes.agent import ACCEPT, DECLINE, VERSIONS, Answer, Never, Script, Version, agent
 from tests.fakes.records_api import SECRET as RECORDS_SECRET
 from tests.fakes.smtp_server import PASSWORD, USERNAME
 from tests.gateway.rig import Running, token_for
@@ -140,15 +140,20 @@ async def send(
 async def test_s15_the_message_sent_is_the_message_shown(
     deployed: ToolkitDeployment, version: Version
 ) -> None:
-    script = Script([ACCEPT])
+    script, never = Script([ACCEPT]), Never()
     arguments = {"subject": SUBJECT, "body": BODY, "in_reply_to": "<m1.x@mail.example>"}
     with deployed.running() as running:
         async with agent(
-            url(running, "mail"), version=version, script=script, headers=headers()
+            url(running, "mail"),
+            version=version,
+            script=script,
+            headers=headers(),
+            **never.options(),
         ) as client:
             result, shown = await send(deployed, client, arguments, script, "approve")
         code, verified, _ = deployed.cli(running, "ledger", "--verify")
     assert not result.is_error, text(result)
+    assert never.called == []
     lines = shown.split("\n")
     ref = lines[0].removeprefix("Approval request ")
     plan = [
@@ -186,11 +191,14 @@ async def test_s15_the_message_sent_is_the_message_shown(
 
 
 async def test_s15_a_decline_sends_nothing(deployed: ToolkitDeployment) -> None:
-    script = Script([DECLINE])
+    script, never = Script([DECLINE]), Never()
     with deployed.running() as running:
-        async with agent(url(running, "mail"), script=script, headers=headers()) as client:
+        async with agent(
+            url(running, "mail"), script=script, headers=headers(), **never.options()
+        ) as client:
             arguments = {"subject": SUBJECT, "body": BODY}
             result, _ = await send(deployed, client, arguments, script, "deny")
+    assert never.called == []
     said = {
         "gateway": "declined by operator (ref ",
         "vault_approval": "refused: the operator declined this call (ref ",
@@ -205,13 +213,16 @@ async def test_s15_an_unanswered_send_sends_nothing(deployed: ToolkitDeployment)
     """S15's timeout: nobody answers the send by its deadline, the agent's own prompt (its
     client's timeout shortened) or the vault's hold (past its end, B.7): nothing is sent, and the
     gateway's ledger has the call timed out and not sent."""
-    script = Script([Answer(delay=3.0)])
+    script, never = Script([Answer(delay=3.0)]), Never()
     if deployed.approval == "gateway":
         deployed.ask_timeout = 1
     with deployed.running() as running:
-        async with agent(url(running, "mail"), script=script, headers=headers()) as client:
+        async with agent(
+            url(running, "mail"), script=script, headers=headers(), **never.options()
+        ) as client:
             arguments = {"subject": SUBJECT, "body": BODY}
             result, _ = await send(deployed, client, arguments, script, "expire")
+    assert never.called == []
     assert result.is_error
     said = {
         "gateway": "no answer in time",
@@ -239,9 +250,11 @@ def rows(n: int) -> list[dict[str, Any]]:
 async def test_s16_batches(tmp_path: Path, ca: ProviderCA) -> None:
     deployed = ToolkitDeployment(tmp_path, ca)
     deployed.records.differ_item = 3
-    script = Script([ACCEPT, ACCEPT])
+    script, never = Script([ACCEPT, ACCEPT]), Never()
     with deployed.running() as running:
-        async with agent(url(running, "records"), script=script, headers=headers()) as client:
+        async with agent(
+            url(running, "records"), script=script, headers=headers(), **never.options()
+        ) as client:
             added = await client.call_tool("add_records", {"records": rows(25)})
             too_many = await client.call_tool("add_records", {"records": rows(26)})
             ids = [item.get("value") for item in json.loads(text(added))["items"]]
@@ -255,6 +268,7 @@ async def test_s16_batches(tmp_path: Path, ca: ProviderCA) -> None:
             f"{vault_url}/records/v1/records/r0001", headers={"x-zoeymcp-gateway": key}
         )
     assert len(script.prompts) == 2  # one per batch: add, then archive
+    assert never.called == []
     assert "Records (25):" in script.prompts[0].message
     added_items = json.loads(text(added))["items"]
     assert [i["ok"] for i in added_items].count(False) == 1

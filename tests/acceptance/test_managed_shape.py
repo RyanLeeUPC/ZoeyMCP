@@ -68,6 +68,7 @@ from tests.fakes.browser import Browser, Page
 from tests.fakes.mcp_server import PATH, McpFake, base_tools
 from tests.gateway.rig import pin_of_fake
 from tests.portal.flows import enrol, login, redeem
+from zoeymcp.common.policy.restart import LIMIT_TEXT
 from zoeymcp.common.policy.schema import RemoteServer, hash_token
 from zoeymcp.gateway import witness
 from zoeymcp.vault.keys import KeySet, generate_master_key
@@ -1191,6 +1192,111 @@ def test_gateway_key_rotation_managed(tmp_path: Path) -> None:
     finally:
         gateway.stop()
         made.stop()
+
+
+GATEWAY_LIMITS = ("max_request_bytes", "session_idle_timeout")
+BIG_BODY = 2 * 2**20  # over the default max_request_bytes (1 MiB), under the raised 4 MiB
+SDK_TOO_LARGE = "Request body too large"  # the SDK session manager's own 413
+
+
+def big_hello(port: int) -> tuple[int, str] | None:
+    """A legacy ``initialize`` of about 2 MiB from agent1 to the gateway on ``port``: its status
+    and body, or None while it can't answer."""
+    hello = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {"experimental": {"padding": {"text": "x" * BIG_BODY}}},
+            "clientInfo": {"name": "big", "version": "1"},
+        },
+    }
+    headers = {
+        "authorization": f"Bearer {AGENT_TOKEN}",
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+    }
+    url = f"http://127.0.0.1:{port}/s/{SERVER}/mcp"
+    try:
+        answer = httpx2.post(url, headers=headers, content=json.dumps(hello), timeout=30)
+    except httpx2.HTTPError:
+        return None
+    return answer.status_code, answer.text
+
+
+def body_refusals(gateway: Process) -> int:
+    """The requests the gateway's own body check refused (its log), not the SDK's."""
+    return sum(1 for e in events(gateway.output(), "auth_refused") if e.get("reason") == "body")
+
+
+def test_raised_limits_wait_for_a_gateway_restart(tmp_path: Path, ca: ProviderCA) -> None:
+    """J15's gateway half (D-219, D-47, I.2): an import, with the vault stopped, raising
+    ``gateway.limits.max_request_bytes`` (1 MiB to 4 MiB) and ``session_idle_timeout`` says in
+    its plan that each needs a gateway restart. The running gateway applies the revision and
+    logs ``limits_change_needs_restart``; its own body check now lets a 2 MiB request through,
+    but the SDK session manager it started with still refuses it (413, the SDK's text). Restarted
+    on the same state, the gateway takes the raised limit: the same request is answered."""
+    fake = McpFake(mode="modern")
+    pins = {wire["name"]: pin_of_fake(fake, wire["name"]) for wire in base_tools()}
+    made = vault(tmp_path)
+    made.ca = ca.ca_file
+    gateway_state = tmp_path / "gateway-state"
+    port = free_port()
+    with serve_tls(fake.app(), ca, lifespan=True) as upstream:
+        made.policy = notes_policy(made.portal, upstream, pins)
+        running = made.start()
+        gateway = gateway_on(made, gateway_state, port)
+        try:
+            deployment = deployment_of(made)
+            wait_for(lambda: seen_by(gateway_state) == {deployment: 1}, "revision 1", gateway)
+            refused = big_hello(port)
+            assert refused is not None
+            assert refused[0] == 413
+            assert SDK_TOO_LARGE not in refused[1]  # the gateway's own check refused it
+            assert body_refusals(gateway) == 1
+            made.stop()
+
+            def raised(data: dict[str, Any]) -> None:
+                limits = data["gateway"].setdefault("limits", {})
+                limits.update(max_request_bytes=4 * 2**20, session_idle_timeout=3600)
+
+            state = ["--state", str(made.state)]
+            text = edited_export(made, raised, state)
+            argv = ["policy", "import", "-", *state, "--yes", "--accept-widening"]
+            code, _, err = made.cli(argv, text)
+            assert code == 0, err
+            for name in GATEWAY_LIMITS:
+                assert f"  Restart needed: gateway.limits.{name}: {LIMIT_TEXT}\n" in err, err
+            running = made.start()
+            wait_for(lambda: seen_by(gateway_state) == {deployment: 2}, "revision 2", gateway)
+            needs = "limits_change_needs_restart"
+            wait_for(lambda: bool(events(gateway.output(), needs)), needs, gateway, running)
+            still = big_hello(port)
+            assert still is not None
+            assert still == (413, SDK_TOO_LARGE)  # the session manager's limit is the old one
+            assert body_refusals(gateway) == 1  # the gateway's own check let it through
+            gateway.stop()
+            port = free_port()
+            gateway = gateway_on(made, gateway_state, port)
+            wait_for(lambda: seen_by(gateway_state) == {deployment: 2}, "revision 2", gateway)
+            answered = None
+
+            def taken() -> bool:
+                nonlocal answered
+                answered = big_hello(port)
+                return answered is not None and answered[0] != 503  # until the view is fresh
+
+            wait_for(taken, "the raised limit", gateway, running)
+        finally:
+            gateway.stop()
+            made.stop()
+    assert answered is not None
+    assert answered[0] == 200, answered[1][:200]
+    assert len(events(gateway.output(), needs)) == 1  # the restarted gateway started with them
+    saved = head_policy(opened(made)).gateway
+    assert saved is not None
+    assert (saved.limits.max_request_bytes, saved.limits.session_idle_timeout) == (4 * 2**20, 3600)
 
 
 # --- a reviving rollback is the host's (Y5, Y12; J6) ------------------------------------------

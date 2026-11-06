@@ -106,6 +106,25 @@ class Script:
         return types.ElicitResult(action=answer.action, content=content)
 
 
+@dataclass
+class Never:
+    """The agent's sampling and roots callbacks, which nothing may ever reach (M4 design M.1):
+    each call is recorded and refused. Pass :meth:`options` to the client."""
+
+    called: list[str] = field(default_factory=list)
+
+    async def sampling(self, *args: object) -> types.ErrorData:
+        self.called.append("sampling")
+        return types.ErrorData(code=types.INTERNAL_ERROR, message="the agent was sampled")
+
+    async def roots(self, *args: object) -> types.ErrorData:
+        self.called.append("roots")
+        return types.ErrorData(code=types.INTERNAL_ERROR, message="the agent's roots were read")
+
+    def options(self) -> dict[str, Any]:
+        return {"sampling_callback": self.sampling, "list_roots_callback": self.roots}
+
+
 # --- rewriting what the SDK declares ------------------------------------------------------------
 
 
@@ -245,8 +264,10 @@ class RawAgent:
         url: str | None = None,
         request_state: object = None,
         input_responses: object = None,
+        http: httpx.AsyncClient | None = None,
     ) -> dict[str, Any]:
-        """One modern ``tools/call``; returns the JSON-RPC answer."""
+        """One modern ``tools/call``; returns the JSON-RPC answer. ``http`` is a client to send
+        it on, for a test that sends many (a new client per call is slow to make)."""
         body = self.modern_body(
             name, arguments, request_state=request_state, input_responses=input_responses
         )
@@ -256,8 +277,11 @@ class RawAgent:
             "mcp-method": "tools/call",
             "mcp-name": name,
         }
-        async with httpx.AsyncClient(timeout=30) as http:
+        if http is not None:
             response = await http.post(url or self.url, json=body, headers=headers)
+            return sse_messages(response.text)[-1]
+        async with httpx.AsyncClient(timeout=30) as own:
+            response = await own.post(url or self.url, json=body, headers=headers)
         return sse_messages(response.text)[-1]
 
     # --- legacy ---

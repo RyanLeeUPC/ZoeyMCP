@@ -27,11 +27,23 @@ running vault as a reload serves it: the gateway sees only the new view, whichev
 - (M8 step 12b; G-24, E-6) A **relay** of an ``out_of_band`` client survives a view change that
   doesn't touch it: the rewritten rule asks a relayed record for ``out_of_band``, not
   ``attended``, so the operator's approval still runs the call, once.
+
+D-76's last two rows (the pre-main test-debt pass), each in both eras, nothing sent:
+
+- The **view goes stale** before the accept's re-check: no contact with the vault for
+  ``policy_max_stale``, so the re-check has no fresh view and refuses ``changed``. The agent's
+  answer is itself a request that needs a fresh view at the door, so the staleness lands
+  between the door and the re-check: the policy client's last contact is moved back as the
+  re-check starts.
+- An **admit refusal inside pool.call**: the re-check admits the tool under its pin, then the
+  upstream drifts and the gateway marks it before the forward, so the pool's own admission
+  refuses (``NotAdmitted``): ``decided accept``, then ``outcome not_sent`` with detail
+  ``changed``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,6 +73,7 @@ from tests.gateway.test_approvals_remote import (
     approving,
     by_ref,
     headers,
+    ledger_records,
     ref_of,
     text,
 )
@@ -69,7 +82,8 @@ from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.change import MoveToAllow, PolicyChange, SetServerReview, apply
 from zoeymcp.common.policy.schema import RemoteServer, Tools
 from zoeymcp.gateway import upstream
-from zoeymcp.gateway.approve import CHANGED, DECISION_TEXTS
+from zoeymcp.gateway.approvals import Pending
+from zoeymcp.gateway.approve import CHANGED, DECISION_TEXTS, Asking
 from zoeymcp.gateway.pipeline import STATE_REFUSED, UNKNOWN_TOOL
 
 pytestmark = pytest.mark.anyio
@@ -370,3 +384,92 @@ async def test_a_relay_survives_an_unrelated_view_change(tmp_path: Path) -> None
         ("decided", "accept"),
         ("outcome", ("ok", None)),
     ]
+
+
+# --- the view stale at the re-check, and an admit refusal inside pool.call (D-76) ---------------
+
+
+Recheck = Callable[[Asking, Pending], Awaitable[bool]]
+
+
+def outcome_detail(deployed: Deployed, ref: str) -> object:
+    [outcome] = [r for r in ledger_records(deployed) if r.ref == ref and r.kind == "outcome"]
+    return outcome.fields["detail"]
+
+
+@pytest.mark.parametrize("version", ERAS)
+async def test_a_view_gone_stale_at_the_recheck_refuses_the_call(
+    tmp_path: Path, version: Version, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B.5, D-76: the accept's re-check finds no fresh view (no contact with the vault for
+    ``policy_max_stale``), so the call is refused ``changed`` and nothing is sent."""
+    script = Script([ACCEPT])
+    with waiting(tmp_path) as (deployed, running, _fake), anyio.fail_after(BOUND):
+        app = running.app
+        recheck: Recheck = app.approvals._changed
+        rechecked: list[bool] = []
+
+        async def stale_first(asking: Asking, record: Pending) -> bool:
+            snapshot, last = app.policy.snapshot, app.policy.last_contact
+            assert snapshot is not None
+            assert last is not None
+            # No await between this and the re-check's read: the long poll can't renew it first.
+            app.policy.last_contact = last - snapshot.view.gateway.limits.policy_max_stale - 1
+            rechecked.append(await recheck(asking, record))
+            return rechecked[-1]
+
+        monkeypatch.setattr(app.approvals, "_changed", stale_first)
+        async with agent(
+            running.mcp(), version=version, script=script, headers=headers()
+        ) as client:
+            answer = await client.call_tool("echo", {"text": "hi"})
+    assert rechecked == [True]
+    assert text(answer) == f"{CHANGED} (ref {ref_of(answer)})"
+    assert len(script.prompts) == 1
+    assert deployed.fake.calls == []
+    assert deployed.events("policy_stale")
+    ref = ref_of(answer)
+    assert by_ref(deployed, ref) == [
+        ("asked", "legacy" if version != "modern" else "modern"),
+        ("decided", "changed"),
+        ("outcome", "not_sent"),
+    ]
+    assert outcome_detail(deployed, ref) == "changed"
+
+
+@pytest.mark.parametrize("version", ERAS)
+async def test_an_admit_refusal_inside_the_forward_sends_nothing(
+    tmp_path: Path, version: Version, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B.5, B.6, D-76: the re-check admits ``echo`` under the pin it was asked with; then the
+    upstream changes it and the gateway marks the drift before the forward, so the pool's own
+    admission inside ``pool.call`` refuses. The accept is on the ledger, but nothing is sent:
+    ``outcome not_sent``, detail ``changed``, and the agent reads ``changed``."""
+    script = Script([ACCEPT])
+    with waiting(tmp_path) as (deployed, running, fake), anyio.fail_after(BOUND):
+        app = running.app
+        recheck: Recheck = app.approvals._changed
+        rechecked: list[bool] = []
+
+        async def drift_after(asking: Asking, record: Pending) -> bool:
+            rechecked.append(await recheck(asking, record))
+            await drifted(fake, running)  # on the gateway's loop, before the forward
+            return rechecked[-1]
+
+        monkeypatch.setattr(app.approvals, "_changed", drift_after)
+        async with agent(
+            running.mcp(), version=version, script=script, headers=headers()
+        ) as client:
+            answer = await client.call_tool("echo", {"text": "hi"})
+    assert rechecked == [False]  # the re-check passed: the refusal is the forward's own
+    assert text(answer) == f"{CHANGED} (ref {ref_of(answer)})"
+    assert deployed.fake.calls == []
+    assert [event["tool"] for event in deployed.events("tool_drift")] == ["echo"]
+    ref = ref_of(answer)
+    assert by_ref(deployed, ref) == [
+        ("asked", "legacy" if version != "modern" else "modern"),
+        ("decided", "accept"),
+        ("outcome", "not_sent"),
+    ]
+    assert outcome_detail(deployed, ref) == "changed"
+    assert app.approvals.table.get(ref) is None  # the lock is free

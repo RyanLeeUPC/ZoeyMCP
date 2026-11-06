@@ -7,6 +7,12 @@ The text-surface rows (M8 step 19, D-75's M8 part; FM-17): a tool whose descript
 pre-approved is still asked, its prompt byte-equal to ``render_call``'s; a result whose text
 imitates an approval prompt reaches the agent as a result and asks nobody; and one imitating
 ``pending <id>`` gets the model's ``check_approval`` nothing but ``unknown or expired``.
+
+D-75's back-channel rows (the pre-main test-debt pass; M.1): an upstream's script of several asks
+during an approved call (an elicitation imitating the gateway's prompt on the call stream and on
+the GET stream, then sampling), and a modern ``input_required`` of each kind, never reach the
+agent: it sees the gateway's own prompt alone, and its sampling and roots callbacks are never
+called.
 """
 
 from __future__ import annotations
@@ -33,12 +39,13 @@ from tests.fakes.agent import (
     DECLINE,
     VERSIONS,
     Answer,
+    Never,
     RawAgent,
     Script,
     Version,
     agent,
 )
-from tests.fakes.mcp_server import McpFake
+from tests.fakes.mcp_server import Ask, McpFake
 from tests.gateway.rig import (
     CLIENTS,
     SERVER,
@@ -717,6 +724,90 @@ async def test_an_upstream_asking_during_an_approved_call_never_reaches_the_agen
     else:  # a legacy upstream's request got an error answer, and the call went on
         assert [answer.outcome.startswith("error") for answer in fake.answers] == [True]
         assert outcome["outcome"] == "ok"
+
+
+# D-75's multi-request script: an elicitation imitating the gateway's prompt on the call stream,
+# another on the GET stream, then sampling with the same text, all during one approved call.
+IMITATING: list[tuple[mcp_server.BackChannel, mcp_server.BackChannelStream]] = [
+    ("elicit_form", "call"),
+    ("elicit_form", "get"),
+    ("sampling", "call"),
+]
+
+
+@pytest.mark.parametrize(
+    ("era", "version"),
+    [("legacy", "modern"), ("legacy", "2025-11-25"), ("auto", "modern")],
+)
+async def test_an_upstream_script_imitating_the_prompt_never_reaches_the_agent(
+    tmp_path: Path, era: str, version: Version
+) -> None:
+    """M.1, D-75: during the approved call, the upstream asks three times, each with a text
+    imitating the gateway's prompt: an elicitation on the call stream, one on the GET stream,
+    then sampling. The agent sees one prompt, the gateway's own, and its sampling and roots are
+    never called. A legacy upstream's three requests each get an error answer, in order on
+    their streams, and the call goes on; a modern upstream's one ``input_required`` holding all
+    three is refused, nothing relayed."""
+    fake = McpFake(back_channels=[Ask(kind, stream, FAKE_PROMPT) for kind, stream in IMITATING])
+    script, never = Script([ACCEPT]), Never()
+    with approving(tmp_path, fake, era=era) as (deployed, running):
+        async with agent(
+            running.mcp(), version=version, script=script, headers=headers(), **never.options()
+        ) as client:
+            result = await client.call_tool("echo", {"text": "hi"})
+    [prompt] = script.prompts
+    assert prompt.message.startswith("Approval request ")
+    assert prompt.message == rendered(prompt.message, {"text": "hi"})
+    assert never.called == []
+    [outcome] = deployed.events("approval_outcome")
+    if era == "legacy":
+        assert [(a.kind, a.stream) for a in fake.answers] == IMITATING
+        assert all(answer.outcome.startswith("error") for answer in fake.answers), fake.answers
+        assert text(result).endswith("hi")
+        assert outcome["outcome"] == "ok"
+    else:
+        assert fake.answers == []
+        assert text(result).startswith(
+            "refused: the server asked for input this gateway doesn't relay"
+        )
+        assert (outcome["outcome"], outcome["detail"]) == ("refused", "upstream_input_required")
+
+
+async def test_a_modern_input_required_of_each_kind_is_refused(tmp_path: Path) -> None:
+    """M.1, D-75: a modern upstream answers each approved call with ``input_required`` of one
+    kind (a form or URL elicitation, sampling, roots, or a ``requestState`` alone): every one is
+    refused with nothing relayed, the agent sees only the gateway's own prompts, and its
+    sampling and roots are never called."""
+    fake = McpFake()
+    script, never = Script([ACCEPT]), Never()
+    kinds: list[mcp_server.BackChannel] = [
+        "elicit_form",
+        "elicit_url",
+        "sampling",
+        "roots",
+        "state_only",
+    ]
+    results: list[CallToolResult] = []
+    with approving(tmp_path, fake) as (deployed, running):
+        async with agent(
+            running.mcp(), script=script, headers=headers(), **never.options()
+        ) as client:
+            for kind in kinds:
+                fake.back_channel = kind  # read per request
+                results.append(await client.call_tool("echo", {"text": kind}))
+    assert len(script.prompts) == len(kinds)
+    assert all(p.message.startswith("Approval request ") for p in script.prompts)
+    assert never.called == []
+    for result in results:
+        assert text(result).startswith(
+            "refused: the server asked for input this gateway doesn't relay"
+        )
+        assert by_ref(deployed, ref_of(result)) == [
+            ("asked", "modern"),
+            ("decided", "accept"),
+            ("outcome", "refused"),
+        ]
+    assert [c.retry for c in fake.calls] == [False] * len(kinds)  # never answered, never retried
 
 
 @pytest.mark.parametrize("version", ["modern", "2025-11-25"])

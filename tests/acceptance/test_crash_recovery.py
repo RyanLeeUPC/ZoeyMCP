@@ -2,7 +2,9 @@
 
 - the vault, while the SMTP fake holds a send's final reply: after a restart the journal closes
   the send ``unknown``, and the key's replay says so without sending again;
-- the gateway, while a prompt waits: after a restart the ledger closes the asked call;
+- the gateway, while a prompt waits: after a restart the ledger closes the asked call, and
+  ``zoeymcp ledger --verify`` over the restarted gateway's admin socket says the chain is whole
+  (D-77's last row; the admin socket is a Unix socket, so that half runs where there is one);
 - the gateway, while the upstream holds an approved call: the outcome is ``unknown``.
 
 Every ``asked`` ends with exactly one ``outcome``, and the chain verifies.
@@ -11,9 +13,12 @@ Every ``asked`` ends with exactly one ``outcome``, and the chain verifies.
 from __future__ import annotations
 
 import concurrent.futures
+import io
 import json
+import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +31,7 @@ from tests.fakes.mcp_server import McpFake
 from tests.fakes.smtp_server import PASSWORD, SmtpFake, Switch, serve_smtp
 from tests.gateway.rig import KEYS, deployment, token_for
 from tests.gateway.test_upstream import review
+from zoeymcp.cli.main import main
 from zoeymcp.common import ledgerformat
 from zoeymcp.common.policy import Policy
 from zoeymcp.gateway.ledger import LEDGER_DIR, Ledger
@@ -126,10 +132,12 @@ def test_a_send_cut_by_a_kill_is_unknown_and_never_sent_again(
 # --- the gateway --------------------------------------------------------------------------------
 
 
-def start_gateway(vault_url: str, state: Path, port: int, log: Path) -> Process:
+def start_gateway(
+    vault_url: str, state: Path, port: int, log: Path, admin: Path | None = None
+) -> Process:
     argv = [
         "gateway", "--vault", vault_url, "--listen", f"127.0.0.1:{port}",
-        "--state", str(state), "--admin-socket", "none",
+        "--state", str(state), "--admin-socket", "none" if admin is None else str(admin),
     ]  # fmt: skip
     process = start(argv, env={"ZOEYMCP_GATEWAY_KEY": KEYS.gateway_key(1)}, log=log)
     wait_port(port, process)
@@ -162,8 +170,18 @@ def closed_exactly_once(state: Path) -> dict[str, list[dict[str, Any]]]:
 
 
 async def kill_while(
-    tmp_path: Path, tool: str, arguments: dict[str, Any], script: Script, ready: Any
+    tmp_path: Path,
+    tool: str,
+    arguments: dict[str, Any],
+    script: Script,
+    ready: Any,
+    *,
+    admin: Path | None = None,
+    restarted: Callable[[], None] | None = None,
 ) -> tuple[McpFake, Path]:
+    """The gateway killed once ``ready`` holds for the call in flight, then restarted on the same
+    state, with its admin socket at ``admin`` (none by default); ``restarted`` runs while the
+    restarted gateway does."""
     fake = McpFake()
     options = {
         "include": TOOLS,
@@ -196,20 +214,62 @@ async def kill_while(
                         await anyio.sleep(0.05)
                 gateway.kill()
                 group.cancel_scope.cancel()
-            gateway = start_gateway(deployed.vault_url, state, port, log)
+            gateway = start_gateway(deployed.vault_url, state, port, log, admin)
+            if restarted is not None:
+                restarted()
         finally:
             gateway.stop()
     return fake, state
 
 
+def ledger_cli(admin: Path, *argv: str) -> tuple[int, str, str]:
+    """``zoeymcp ledger <argv>`` over the gateway's admin socket at ``admin``."""
+    out, err = io.StringIO(), io.StringIO()
+    code = main(["ledger", *argv, "--socket", str(admin)], stdin=io.StringIO(), out=out, err=err)
+    return code, out.getvalue(), err.getvalue()
+
+
 async def test_a_kill_while_a_prompt_waits(tmp_path: Path) -> None:
+    """The prompt's ``asked`` is closed ``not_sent`` by the restart's recovery. Where there is a
+    Unix admin socket, the operator's ``ledger --verify`` over the restarted gateway's says the
+    chain is whole, and ``ledger`` lists the call closed (D-77)."""
     script = Script([Answer(delay=3600)])
+    admin = None
+    said: list[tuple[int, str, str]] = []
+    if sys.platform != "win32":
+        admin = tmp_path / "admin" / "gateway.sock"
+        admin.parent.mkdir(mode=0o700)
+
+    def check() -> None:
+        assert admin is not None
+        deadline = time.monotonic() + 10
+        while not admin.exists():  # served beside the agents' listener, which is up
+            assert time.monotonic() < deadline, "the admin socket never appeared"
+            time.sleep(0.05)
+        said.append(ledger_cli(admin, "--verify"))
+        said.append(ledger_cli(admin))
+
     fake, state = await kill_while(
-        tmp_path, "echo", {"text": "hi"}, script, lambda _fake: bool(script.prompts)
+        tmp_path,
+        "echo",
+        {"text": "hi"},
+        script,
+        lambda _fake: bool(script.prompts),
+        admin=admin,
+        restarted=check if admin is not None else None,
     )
     assert fake.calls == []  # nothing was ever sent
-    [records] = closed_exactly_once(state).values()
+    [(ref, records)] = closed_exactly_once(state).items()
     assert records[-1]["outcome"] == "not_sent"
+    if admin is not None:
+        (code, verified, err), (listed_code, listed, _) = said
+        assert (code, err) == (0, ""), verified
+        # asked, then the recovery's decided abandoned, outcome not_sent and recovered
+        assert verified.startswith("ok: 4 records chain; head seq 3, hash sha256:"), verified
+        assert listed_code == 0
+        [line, recovered] = listed.splitlines()
+        assert line.endswith(f"{ref} agent1 notes/echo legacy abandoned not_sent (restart)"), line
+        assert recovered.endswith("ledger recovered abandoned=1 not_sent=1 unknown=0")
 
 
 async def test_a_kill_while_the_upstream_holds_an_approved_call(tmp_path: Path) -> None:

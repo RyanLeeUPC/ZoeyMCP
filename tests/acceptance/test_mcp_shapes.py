@@ -435,7 +435,10 @@ async def test_s12_a_back_channel_never_reaches_the_agent(
 
     with deployed(tmp_path, ca, fake) as gateway, gateway.running() as running:
         async with agent(
-            running, elicitation_callback=callback, sampling_callback=callback
+            running,
+            elicitation_callback=callback,
+            sampling_callback=callback,
+            list_roots_callback=callback,
         ) as client:
             result = await client.call_tool("echo", {"text": "x"})
         gateway.seen.outputs.append(dumped(result))
