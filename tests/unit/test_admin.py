@@ -1059,7 +1059,7 @@ def test_cli_over_the_socket(tmp_path: Path, socket_dir: Path) -> None:
         assert out.strip() == f"ZOEYMCP_GATEWAY_KEY={KEYS.gateway_key(1)}"
         code, out, err = cli(["setup-code", "--socket", sock])
         assert code == 0
-        assert "Open http://localhost:8081 or https://zoeymcp.tailnet.example and choose" in err
+        assert "Open http://localhost:8081 or https://zoeymcp.tailnet.example, choose I have a" in err
         assert redeem(rig.setup, out.strip()) == Redeemed(int(rig.clock[0]) + 900, False)
         code, out, err = cli(["setup-code", "--reset", "--socket", sock])
         assert code == 0
