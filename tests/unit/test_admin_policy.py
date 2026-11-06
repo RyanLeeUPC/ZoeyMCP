@@ -999,6 +999,44 @@ async def test_a_revision_that_no_longer_verifies_is_a_gap(tmp_path: Path) -> No
     await rig.aclose()
 
 
+async def test_the_oldest_kept_revision_with_its_parent_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-236, D.8, H.3 (15b's review F1): two kept here, 64 in production. Revision 2, the
+    oldest kept, follows the pruned revision 1: the history lists it whole with no gap row, its
+    diff is revision_unknown naming revision 1, and it can still be exported and rolled back
+    to; revision 1 itself is revision_unknown everywhere."""
+    monkeypatch.setattr("zoeymcp.vault.policystore.KEEP", 2)
+    monkeypatch.setattr("zoeymcp.vault.managed.KEEP", 2)
+    rig = PolicyRig(tmp_path)
+    fewer = edited(lambda data: data["gateway"]["clients"]["agent1"].update(servers=["mail"]))
+    for edit in (generation_of(2), fewer):
+        written = import_(rig.vault, edit)
+        assert isinstance(written, Written)
+    assert not (rig.vault.state / "policy" / "revisions" / "0000000001.json").exists()
+    page = (await rig.call("GET", "/policy/revisions")).json()
+    assert [(entry["revision"], entry.get("gap", False)) for entry in page["revisions"]] == [
+        (3, False),
+        (2, False),
+    ]
+    assert page["next"] is None
+    for path in ("/policy/revisions/2/diff", "/policy/revisions/1"):
+        answer = await rig.call("GET", path)
+        assert (answer.status_code, answer.json()["reason"]) == (409, "revision_unknown"), path
+        assert answer.json()["error"] == "Revision 1 is no longer kept, or never was."
+    against = await rig.call("GET", "/policy/revisions/3/diff")
+    assert against.status_code == 200, against.text
+    assert against.json()["against"] == 2
+    exported = await rig.call("GET", "/policy/export", params=[("revision", "2")])
+    assert exported.status_code == 200, exported.text
+    plan, done = await rig.write("/policy/rollback/2", query=[("accept_widening", "1")])
+    assert plan.status_code == 200, plan.text
+    assert plan.json()["rows"][0] == ["Revision", "4, from 3: the content of revision 2"]
+    assert done is not None
+    assert done.status_code == 200, done.text
+    await rig.aclose()
+
+
 def generation_of(value: int) -> Callable[[Policy], Policy]:
     """A candidate builder: the egress key generation raised to ``value``."""
     return edited(lambda data: data.update(egress_key_generation=value))

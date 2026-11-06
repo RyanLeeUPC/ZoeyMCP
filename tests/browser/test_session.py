@@ -109,9 +109,9 @@ def two_ports(tmp_path: Path, forwarder: Forwarder) -> Iterator[PortalRig]:
 def full_session(
     page: Page, other: BrowserContext, rig: PortalRig
 ) -> tuple[CdpAuthenticator, Page]:
-    """Item 11's session: set up with a code, sign in with the new passkey, a second browser
-    signed in with the same passkey, then **Sessions**, **End the other sessions** and **Sign
-    out**. Returns the passkeys and the second browser's page."""
+    """Item 11's session: set up with a code, **Sign in with the new passkey**, a second
+    browser signed in with the same passkey, then **Sessions**, **End the other sessions** and
+    **Sign out**. Returns the passkeys and the second browser's page."""
     passkeys = set_up(page, rig)
     elsewhere = other.new_page()
     open_portal(elsewhere, rig.origin)
@@ -257,9 +257,9 @@ def test_item_4_every_post_is_same_origin_and_carries_the_real_origin(
     rig: PortalRig, page: Page, other_context: BrowserContext, watch: Watch
 ) -> None:
     """Item 4: "On any ``POST`` the page makes (sign in, sign out, end the other sessions), the
-    request headers show ``Sec-Fetch-Site: same-origin`` and the real ``Origin``, not ``null``,
-    though the page sends no referrer. Pass: both, on every ``POST``." Read from the headers as
-    the browser sent them."""
+    request headers show ``Sec-Fetch-Site: same-origin`` and the real ``Origin`` (...), not
+    ``null``, though the page sends no referrer. Pass: both, on every ``POST``." Read from the
+    headers as the browser sent them."""
     full_session(page, other_context, rig)
     posts = watch.posts()
     paths = {urlsplit(request.url).path for request in posts}
@@ -406,9 +406,10 @@ def test_item_10_a_neighbour_port_gets_nothing_and_signs_nobody_out(
 def test_item_11_a_full_session_makes_no_violation(
     rig: PortalRig, page: Page, other_context: BrowserContext, watch: Watch
 ) -> None:
-    """Item 11: "run a full session: set up with a code, sign in with the new passkey, open
-    Sessions, end the other sessions, sign out. Pass: no Trusted Types or Content Security
-    Policy violation in the console", with the page's policy in force (no ``bypass_csp``)."""
+    """Item 11: "run a full session: set up with a code, **Sign in with the new passkey**, open
+    **Sessions**, **End the other sessions**, **Sign out**. Pass: no Trusted Types or Content
+    Security Policy violation in the console", with the page's policy in force (no
+    ``bypass_csp``)."""
     answer = page.goto(f"{rig.origin}/")
     assert answer is not None
     policy = answer.headers["content-security-policy"]

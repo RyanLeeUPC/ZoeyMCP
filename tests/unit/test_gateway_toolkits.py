@@ -21,9 +21,11 @@ from zoeymcp.common.policy.view import GatewayView, build_view
 from zoeymcp.gateway import logs
 from zoeymcp.gateway.marks import DriftMarks
 from zoeymcp.gateway.toolkits import Loaded, Toolkits, Unavailable, origin_problem
-from zoeymcp.gateway.toolkitvault import CallState, ToolkitVault
+from zoeymcp.gateway.toolkitvault import MAX_QUERY_BYTES, CallState, ToolkitVault
 from zoeymcp.gateway.vaultlink import (
     GATEWAY_HEADER,
+    TOOLKIT_MAX_ANSWER_BYTES,
+    TOOLKIT_MAX_REQUEST_BYTES,
     KeySource,
     UpstreamBlocked,
     UpstreamRedirect,
@@ -266,6 +268,71 @@ async def test_closed_and_blocked_requests_never_leave(captured: io.StringIO) ->
     [blocked] = events(captured, "toolkit_vault_blocked")
     assert blocked == {**blocked, "server": "kit", "tool": "t", "slot": "db", "reason": "closed"}
     assert "path" not in blocked
+
+
+def padded_answer(size: int) -> httpx2.Response:
+    """A JSON object answer of exactly ``size`` bytes."""
+    head, tail = b'{"a":"', b'"}'
+    content = head + b"x" * (size - len(head) - len(tail)) + tail
+    assert len(content) == size
+    return httpx2.Response(200, content=content, headers={"content-type": "application/json"})
+
+
+async def test_an_answer_past_4_mib_is_refused_and_one_at_the_cap_is_read() -> None:
+    """D-79: TOOLKIT_MAX_ANSWER_BYTES (4 MiB) caps what a slot reads from the vault; a 5 MiB
+    answer is refused ``too_large`` and one of exactly 4 MiB is read whole."""
+    assert TOOLKIT_MAX_ANSWER_BYTES == 4 * 2**20
+    answers = iter(
+        [
+            padded_answer(TOOLKIT_MAX_ANSWER_BYTES),
+            padded_answer(5 * 2**20),
+            padded_answer(TOOLKIT_MAX_ANSWER_BYTES + 1),
+        ]
+    )
+    vault = vault_for(lambda request: next(answers))
+    slots = vault.bind(CallState("t", "0123456789abcdef", "allow", SendLedger(None)))
+    whole = await slots["db"].get_object("/v1/records/r1")
+    refused = []
+    for _ in range(2):
+        with pytest.raises(VaultError) as raised:
+            await slots["db"].get_object("/v1/records/r1")
+        refused.append((raised.value.status, raised.value.code))
+    await vault.aclose()
+    assert len(str(whole["a"])) == TOOLKIT_MAX_ANSWER_BYTES - len(b'{"a":""}')
+    assert refused == [(502, "too_large"), (502, "too_large")]
+
+
+async def test_the_slots_own_request_check(captured: io.StringIO) -> None:
+    """D-79: the bound slot refuses a body past 1 MiB or a query past 2048 bytes itself, before
+    the transport sees it; both bounds are inclusive."""
+    sent: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        sent.append(request)
+        return json_answer({})
+
+    vault = vault_for(handler)
+    slots = vault.bind(CallState("t", "0123456789abcdef", "allow", SendLedger(None)))
+    framing = len(b'{"n":""}')
+    await slots["db"].post_json("/v1/notes", {"n": "x" * (TOOLKIT_MAX_REQUEST_BYTES - framing)})
+    await slots["db"].get_object("/v1/records/r1", query={"q": "y" * (MAX_QUERY_BYTES - 2)})
+    found = []
+    for request in (
+        slots["db"].post_json("/v1/notes", {"n": "x" * (TOOLKIT_MAX_REQUEST_BYTES - framing + 1)}),
+        slots["db"].get_object("/v1/records/r1", query={"q": "y" * (MAX_QUERY_BYTES - 1)}),
+    ):
+        with pytest.raises(VaultError) as raised:
+            await request
+        found.append((raised.value.status, raised.value.code))
+    await vault.aclose()
+    assert found == [(403, "blocked_too_large"), (403, "blocked_query")]
+    assert [len(request.content) for request in sent] == [TOOLKIT_MAX_REQUEST_BYTES, 0]
+    assert len(sent[1].url.query) == MAX_QUERY_BYTES
+    assert [e["reason"] for e in events(captured, "toolkit_vault_blocked")] == [
+        "too_large",
+        "query",
+    ]
+    assert events(captured, "toolkit_request_blocked") == []
 
 
 def test_the_transport_check() -> None:

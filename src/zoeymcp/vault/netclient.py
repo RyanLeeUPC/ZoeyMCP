@@ -88,6 +88,13 @@ TOKEN_TIMEOUT: Final = httpx.Timeout(ATTEMPT_DEADLINE, connect=TOKEN_CONNECT_TIM
 # and an idle connection dropped before a common proxy's idle close does it (D-228).
 APPROVER_TIMEOUT: Final = httpx.Timeout(60.0, connect=10.0)
 APPROVER_KEEPALIVE: Final = 4.0
+# How long every other pool keeps an idle connection (D-228): below the 5 s after which uvicorn's
+# default (which many Python MCP servers run on), Node's and Apache's close one, so the pool never
+# reuses a connection just as its server closes it. No request is retried (a held forward never
+# is, M8 design H3), so a request sent on such a connection would fail: a call, or a listing the
+# gateway's session ends on. A server with a shorter idle close closes first, and the pool finds
+# that connection closed and opens another; only a request sent at the very moment remains.
+POOL_KEEPALIVE: Final = 4.0
 # A route's 502 code, a token call's failure reason, and the onboarding refusal (M7 design B.2).
 ADDRESS_REFUSED: Final = "address_refused"
 # The per-request exception (TI-10): (onboarding id, purpose, host:port).
@@ -286,12 +293,14 @@ def _pooled(
     keepalive_expiry: float | None = None,
 ) -> httpx.AsyncHTTPTransport:
     """httpx's transport, for its request and error mapping, over a pool with ``backend``, on
-    the Unix socket ``uds`` when given; an idle connection is kept ``keepalive_expiry`` seconds
-    when given, else httpx's default."""
+    the Unix socket ``uds`` when given. With ``keepalive``, an idle connection is kept
+    ``keepalive_expiry`` seconds when given, else :data:`POOL_KEEPALIVE`; without it, none is."""
     transport = httpx.AsyncHTTPTransport(verify=context, trust_env=False)
-    limits = httpx.Limits() if keepalive else httpx.Limits(max_keepalive_connections=0)
-    if keepalive_expiry is not None:
-        limits = httpx.Limits(keepalive_expiry=keepalive_expiry)
+    if keepalive:
+        expiry = POOL_KEEPALIVE if keepalive_expiry is None else keepalive_expiry
+        limits = httpx.Limits(keepalive_expiry=expiry)
+    else:
+        limits = httpx.Limits(max_keepalive_connections=0)
     transport._pool = httpcore.AsyncConnectionPool(
         ssl_context=context,
         max_connections=limits.max_connections,
@@ -390,8 +399,12 @@ def guarded_transport(
     :class:`GuardedTransport` with ``exceptions``."""
     context = ssl_context()
     if egress_proxy is not None:
-        # CONNECT by name: the proxy resolves the target and judges its address.
-        return httpx.AsyncHTTPTransport(verify=context, proxy=egress_proxy, trust_env=False)
+        # CONNECT by name: the proxy resolves the target and judges its address. A tunnel ends
+        # when its server closes the connection, so it is kept as briefly (POOL_KEEPALIVE).
+        limits = httpx.Limits(keepalive_expiry=POOL_KEEPALIVE)
+        return httpx.AsyncHTTPTransport(
+            verify=context, proxy=egress_proxy, trust_env=False, limits=limits
+        )
     hooks = HOOKS or Hooks()
     return GuardedTransport(context, exceptions, resolver=hooks.resolver, dial=hooks.dial)
 

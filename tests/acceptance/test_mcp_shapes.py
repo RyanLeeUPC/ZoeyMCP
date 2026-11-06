@@ -567,23 +567,18 @@ def test_s12_drift_and_flip_back_through_the_portal(
             wait_for(lambda: served(port) == tools, "notes served", gateway, running)
 
             def relisted(change: Callable[[], None], what: str) -> None:
-                """The upstream changes and announces it; the agents' connection lists again.
-
-                A listing that fails (the vault's pooled connection to the fake closed by its
-                keep-alive just then) ends the agents' connection, which only an agent opens
-                again: an agent lists until it is open (past the backoff), and its connect
-                listing, after the change, is a listing of the changed definition."""
+                """The upstream changes and announces it; the agents' connection lists again,
+                and that listing doesn't fail: the vault's pool drops an idle connection to the
+                fake before the fake's keep-alive closes it, and the gateway's link drops one
+                before the vault's does (D-228), so no request meets a closing connection."""
                 before = len(served_listings(gateway.output()))
                 failed = len(served_failures(gateway.output()))
                 change()
                 fake.announce()
-
-                def listed() -> bool:
-                    if len(served_failures(gateway.output())) > failed:
-                        served(port)
-                    return len(served_listings(gateway.output())) > before
-
-                wait_for(listed, what, gateway, running)
+                wait_for(
+                    lambda: len(served_listings(gateway.output())) > before, what, gateway, running
+                )
+                assert len(served_failures(gateway.output())) == failed, gateway.output()
 
             # The flip-back row: changed, then the reviewed definition again; the mark holds.
             relisted(lambda: fake.change_tool("description"), "the listing of the change")

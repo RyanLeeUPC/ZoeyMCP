@@ -372,13 +372,21 @@ def test_a_kill_during_register(tmp_path: Path, ca: ProviderCA) -> None:
 J1 = ["login", "--mcp", SERVER_URL, "--name", "notes"]
 
 
+def without_review_grace(vault: Deployment) -> None:
+    """No gateway polls this vault for reviews, so a review it queues is refused at once
+    instead of after the 45 s start grace (D-210): the launcher sets the grace to 0 from the
+    hooks file."""
+    hooks = json.loads(vault.hooks.read_bytes())
+    vault.hooks.write_bytes(json.dumps({**hooks, "review_start_grace": 0.0}).encode())
+
+
 def test_commit_recreates_the_vault(tmp_path: Path, ca: ProviderCA) -> None:
     """FM-3, J1 through the CLI: fragment 1 from a given public client, the commit recreating
     the vault, and the second run, which finds the credential committed, signs in with nothing
-    lost (F-13), queues the review, which has no gateway to run it here (so it is refused once
-    the vault's start grace ends, and the run exits 1), and names the choices file's commands
-    next."""
+    lost (F-13), queues the review, which has no gateway to run it here (so it is refused, at once
+    with no start grace, and the run exits 1), and names the choices file's commands next."""
     with deployed(tmp_path, ca, auth="none") as vault:
+        without_review_grace(vault)
         vault.start()
         code, fragment, err = vault.cli([*J1, "--client-id", CLIENT_ID, "--yes"])
         assert code == 0, err
@@ -400,8 +408,10 @@ def test_commit_recreates_the_vault(tmp_path: Path, ca: ProviderCA) -> None:
 def test_restart_during_login(tmp_path: Path, ca: ProviderCA) -> None:
     """FM-4, J3 through the CLI: the vault killed while the operator is at the provider loses
     the sign-in (M2), and the client secret stored at register stays; the same command then
-    signs in with it, and queues the review, which has no gateway to run it here."""
+    signs in with it, and queues the review, which has no gateway to run it here (refused at
+    once, with no start grace)."""
     with deployed(tmp_path, ca, client_secret=SECRET) as vault:
+        without_review_grace(vault)
         vault.start()
         argv = [*J1, "--issuer", ISSUER, "--client-id", CLIENT_ID, "--client-secret", "--yes"]
         code, fragment, err = vault.cli(argv, io.StringIO(SECRET + "\n"))

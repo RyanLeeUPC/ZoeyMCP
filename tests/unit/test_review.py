@@ -17,6 +17,7 @@ from tests.unit.test_pins import kinds_server, named_prompt, prompt_pin
 from zoeymcp.cli import admin_client
 from zoeymcp.cli import review as view
 from zoeymcp.cli.main import main
+from zoeymcp.common.policy.attention import attention
 from zoeymcp.common.policy.schema import GatewayLimits
 from zoeymcp.common.policy.view import ViewRemoteServer
 from zoeymcp.common.reviewreport import read
@@ -509,6 +510,58 @@ def test_the_summary() -> None:
         [view.NO_SERVERS],
         0,
     )
+
+
+def status_entry(tools: list[Tool], server: ViewRemoteServer) -> dict[str, Any]:
+    """A remote server's status entry from one listing, as the gateway's status builds it."""
+    evaluation = pins.evaluate(tools, server, frozenset(), LIMITS)
+    reports: dict[str, set[str]] = {}
+    for found in evaluation.reports:
+        reports.setdefault(found.kind, set()).add(found.tool)
+    decided = attention(evaluation.listed, server, evaluation.marks)
+    return {
+        **REMOTE,
+        "included": len(server.tools.include),
+        "exposed": len(evaluation.exposed),
+        "marked": sorted(tool for tool, _ in evaluation.marks),
+        "reports": {kind: sorted(names) for kind, names in sorted(reports.items())},
+        "attention": decided.as_dict(),
+    }
+
+
+@pytest.mark.parametrize(
+    ("include", "expected"),
+    [
+        (["a"], 0),  # invalid and duplicate tools nobody included: never served
+        (["a", "bad"], 1),
+        (["a", "twice"], 1),
+    ],
+)
+def test_the_summary_exits_as_review_server_does(include: list[str], expected: int) -> None:
+    """D-234: the summary's exit code follows ``review <server>``'s rule, so a tool listed
+    invalid or duplicate needs the operator only when it is included; the line counts it
+    either way."""
+    server = policy(include, {name: pin(name) for name in include})
+    tools = [tool("a"), tool("bad", "Hidden​ text."), tool("twice"), tool("twice", "Again.")]
+    assert view.exit_code(reviewed(tools, server)) == expected
+    lines, code = view.summary(status(notes=status_entry(tools, server)))
+    assert code == expected
+    assert "  invalid 1  " in lines[0]
+
+
+def test_a_toolkit_in_the_summary_needs_the_operator_for_included_tools_only() -> None:
+    """D-234: a toolkit's line needs the operator when an included tool isn't exposed (as
+    ``review <server>``'s ``clean`` reads it), not for an invalid tool nobody included."""
+    invalid = {**TOOLKIT, "reports": {"invalid": ["other"]}, "attention": QUIET}
+    lines, code = view.summary(status(mail=invalid))
+    assert ("  invalid 1  " in lines[0], code) == (True, 0)
+    included = {**invalid, "reports": {"invalid": ["send_note"]}, "exposed": 0}
+    assert view.summary(status(mail=included))[1] == 1
+    # Hidden by the classification floor: no report, but not exposed.
+    floored = {**TOOLKIT, "reports": {}, "attention": QUIET, "exposed": 0}
+    assert view.summary(status(mail=floored))[1] == 1
+    missing = {**TOOLKIT, "reports": {"missing": ["send_note"]}, "exposed": 0}
+    assert view.summary(status(mail=missing))[1] == 1
 
 
 def test_status_lines() -> None:

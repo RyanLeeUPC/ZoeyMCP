@@ -12,10 +12,11 @@ import anyio
 import httpx2
 import pytest
 
+from tests.unit.test_netclient import keepalive_server
 from zoeymcp.common import canonical
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.view import MODE_HEADER, REVISION_HEADER, build_view, dump_view
-from zoeymcp.gateway import logs, policyclient, witness
+from zoeymcp.gateway import logs, policyclient, vaultlink, witness
 from zoeymcp.gateway.egressrules import CallRegistry
 from zoeymcp.gateway.policyclient import PolicyClient, Snapshot, Witness
 from zoeymcp.gateway.vaultlink import (
@@ -435,6 +436,44 @@ async def test_the_upstream_client_settings() -> None:
         assert http.trust_env is False
         assert http.timeout.read is None
         assert (http.timeout.connect, http.timeout.write, http.timeout.pool) == (10.0, 30.0, 10.0)
+
+
+def test_the_link_keeps_an_idle_connection_below_the_vaults_keep_alive() -> None:
+    """D-228: 4 s, below the vault's listeners' keep-alive (uvicorn's default 5 s), with no
+    retry, for every client on the link."""
+    import uvicorn
+
+    assert vaultlink.LINK_KEEPALIVE == 4.0
+    assert uvicorn.Config(app="unused:app").timeout_keep_alive > vaultlink.LINK_KEEPALIVE
+    for spec in ("http://vault:8080", "unix:/run/v.sock"):
+        transport = vaultlink._inner_transport(parse_link(spec))
+        pool = transport._pool
+        assert (pool._keepalive_expiry, pool._retries) == (vaultlink.LINK_KEEPALIVE, 0)
+
+
+@pytest.mark.parametrize(("kept", "answered"), [(0.4, True), (5.0, False)])
+async def test_no_request_on_the_link_goes_on_a_connection_the_vault_is_closing(
+    monkeypatch: pytest.MonkeyPatch, kept: float, answered: bool
+) -> None:
+    """D-228, a tenth the size: the vault keeps a connection alive 0.5 s (uvicorn's 5 s) and the
+    link keeps one 0.4 s (LINK_KEEPALIVE's 4 s), so a request after 0.6 s idle is answered on a
+    new connection; kept 5 s, as httpx's default did, it fails unretried."""
+    monkeypatch.setattr(vaultlink, "LINK_KEEPALIVE", kept)
+    async with keepalive_server(0.5) as (port, seen):
+        transport = vaultlink._inner_transport(parse_link("http://vault:8080"))
+        async with httpx2.AsyncClient(transport=transport) as http:
+            with anyio.fail_after(10):
+                await http.get(f"http://127.0.0.1:{port}/_zoeymcp/gateway/v1/view")
+                await anyio.sleep(0.6)
+                if answered:
+                    again = await http.get(f"http://127.0.0.1:{port}/_zoeymcp/gateway/v1/view")
+                    assert again.text == "ok"
+                else:
+                    with pytest.raises(httpx2.RemoteProtocolError):
+                        await http.get(f"http://127.0.0.1:{port}/_zoeymcp/gateway/v1/view")
+    assert seen == (
+        ["open", "answered", "open", "answered"] if answered else ["open", "answered", "closed"]
+    )
 
 
 # --- the policy client -----------------------------------------------------------------------

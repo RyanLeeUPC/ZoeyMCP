@@ -222,10 +222,10 @@ def hold_box(tool: Locator) -> Locator:
 def test_item_31_hold_in_the_vault_shows_the_turn_on_plan_before_the_passkey(
     rig: PortalRig, page: Page
 ) -> None:
-    """Item 31's first lines: "the server page's **Hold in the vault** on ``echo`` [here
-    ``write``] shows, before any passkey prompt, the plan's lines ('fake.echo: vault_approval
-    on.', one line for ``desk``, ``nightly`` and ``batch`` each, then the route's credential
-    sentence); confirmed, ``echo`` is held"."""
+    """Item 31's first lines: "on the MCP servers page, the server's **Hold in the vault: echo**
+    [here ``write``] (under its **Tool actions (N)**) shows, before any passkey prompt, the
+    plan's lines ('fake.echo: vault_approval on.', one line for ``desk``, ``nightly`` and
+    ``batch`` each, then the route's credential sentence); confirmed, ``echo`` is held"."""
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")
     hold = notes_tools(page).get_by_role("button", name="Hold in the vault: write", exact=True)
@@ -290,11 +290,11 @@ def test_item_31_with_no_approver_both_controls_are_disabled(
 def test_item_32_turn_off_shows_its_sentence_and_changes_one_tool(
     held: PortalRig, page: Page
 ) -> None:
-    """Item 32's first lines: "**Turn off vault approval** prepares ``tool.vault_approval_off``,
-    and the dialog shows 'echo [write]: vault_approval off. The gateway will ask instead of the
-    vault; a compromised gateway could then skip the approval. Calls waiting now are
-    withdrawn.' whole; one passkey changes that one tool, and the log has
-    ``tool_vault_approval_off``"."""
+    """Item 32's first lines: "**Turn off vault approval: echo** [here ``write``] (under the
+    server's **Tool actions (N)**) prepares ``tool.vault_approval_off``, and the dialog shows
+    'echo [write]: vault_approval off. The gateway will ask instead of the vault; a compromised
+    gateway could then skip the approval. Calls waiting now are withdrawn.' whole; one passkey
+    changes that one tool, and the log has ``tool_vault_approval_off``"."""
     rig = held
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")
@@ -376,10 +376,11 @@ def test_item_32_a_rollback_that_drops_the_hold_is_refused_before_the_passkey(
 
 
 def test_item_32_a_connectors_writers_turn_off_in_one_step_up(mail: PortalRig, page: Page) -> None:
-    """Item 32's "(a connector's writers in one step-up)" (A.4, T-8): **Hold in the vault** on
-    ``kit2``'s ``mail`` connector holds every writer of it and of ``post`` (the closed set) with
-    one passkey; **Turn off vault approval** on ``post`` shows one sentence per tool and the
-    connectors it covers before the passkey, and one passkey turns all three off."""
+    """Item 32's "(a held connector's writers on and off with one passkey each)" (A.4, T-8):
+    **Hold in the vault: connector mail** on ``kit2`` holds every writer of it and of ``post`` (the
+    closed set) with one passkey; **Turn off vault approval: connector post** shows one sentence
+    per tool and the connectors it covers before the passkey, and one passkey turns all three
+    off."""
     rig = mail
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")
@@ -563,9 +564,9 @@ def test_item_20_a_managed_review_is_saved_with_a_passkey_and_a_repin_says_so(
     restarted with ``--drift description``, "**Review again** and **Accept the new definition**
     on ``echo``, **Save**: the dialog's row shows both pins and 're-pinned: you read both
     definitions', and 'No restart needed'; confirmed, the vault's log line
-    ``step_up_confirmed`` names the kind ``tool.repin``, the answer says the gateway takes the
-    new view within seconds, and the server's row is ``reviewed`` again"; the re-pin's row laid
-    out whole (``laid_out``)."""
+    ``step_up_confirmed`` names the kind ``tool.repin``, the line under the review's buttons says
+    the gateway takes the new view within seconds, and the server's row reads Reviewed again";
+    the re-pin's row laid out whole (``laid_out``)."""
     rig = fresh
     passkeys = set_up(page, rig)
     read = review_notes(page, rig, OLD)
@@ -646,14 +647,15 @@ def test_item_20_moves_to_allow_come_first_and_close_writes_nothing(
 def test_item_20_allow_without_asking_and_select_suggested_after_a_drop(
     saved: PortalRig, page: Page
 ) -> None:
-    """Item 20: "on the MCP servers page, **Allow read_01 without asking**: the dialog shows
-    read_01's move and its definition as pinned; confirmed, it is allow (``step_up_confirmed``
-    names ``tool.allow``)"; and "**Review again**, untick ``read_02`` (approve, read-only),
-    **Save** and confirm; then **Review again**, **Clear** and **Select suggested**: ``read_02``,
-    dropped and once approve, comes back ticked at approve, every read-only tool the policy
-    includes at its classification and the other read-only tools at allow (a tool the server
-    doesn't mark read-only, such as ``add``, stays unticked, so the save drops it), and **Save**
-    shows no 'approve -> allow' or 'was approve in an earlier revision' row"."""
+    """Item 20: "on the MCP servers page, open the server's **Tool actions (N)** and choose
+    **Allow read_01 without asking**: the dialog shows read_01's move and its definition as
+    pinned; confirmed, it is allow (``step_up_confirmed`` names ``tool.allow``)"; and "**Review
+    again**, untick ``read_02`` (approve, read-only), **Save** and confirm; then **Review
+    again**, **Clear** and **Select suggested**: ``read_02``, dropped and once approve, comes
+    back ticked at approve, every read-only tool the policy includes at its classification and
+    the other read-only tools at allow (a tool the server doesn't mark read-only, such as
+    ``add``, stays unticked, so the save drops it), and **Save** shows no 'approve -> allow' or
+    'was approve in an earlier revision' row"."""
     rig = saved
     set_up(page, rig)
     review_notes(page, rig, OLD)  # the vault holds a review showing read_01's definition
@@ -690,9 +692,9 @@ def test_item_20_allow_without_asking_on_a_vault_holding_no_review_reviews_first
     saved: PortalRig, page: Page
 ) -> None:
     """Item 20: "restart the vault (it holds reviews in memory only), sign in, and on the MCP
-    servers page **Allow read_02 without asking**: the page reviews the server first, then opens
-    the same dialog for read_02; **Close** writes nothing". A vault just started holds no review,
-    as a restarted one does."""
+    servers page, under the server's **Tool actions (N)**, **Allow read_02 without asking**: the
+    page reviews the server first, then opens the same dialog for read_02; **Close** writes
+    nothing". A vault just started holds no review, as a restarted one does."""
     rig = saved
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")
@@ -755,8 +757,8 @@ def test_item_21_the_policy_page_names_the_head_and_lists_the_history(
     commit, reload or generate; every revision but the head has **Roll back to revision N**";
     "**History** lists every revision newest first, each with when, by whom ... and what made it,
     the import's reason with its markup shown as text; **Show the changes** on the revision that
-    moved ``add`` and ``slow`` lists those rows, each 'wider', and on the seed lists the whole
-    policy from an empty one, the client's token hash only as ``(set)``"."""
+    moved ``add`` and ``slow`` to allow lists those rows, each 'wider', and on the seed lists the
+    whole policy from an empty one, the client's token hash only as ``(set)``"."""
     rig = history_rig
     set_up(page, rig)
     open_section(page, "Policy")
@@ -845,12 +847,13 @@ def test_item_21_a_rollback_that_revives_or_widens_is_refused_before_the_passkey
     history_rig: PortalRig, page: Page, watch: Watch
 ) -> None:
     """Item 21: "**Roll back to revision N** on the revision that added ``ci-runner``: refused
-    before any passkey prompt, 'Rolling back to revision N brings back client ci-runner, removed
-    in revision M: only the host can, with zoeymcp policy rollback and --allow-revive.', and
-    nothing is written"; and a rollback "now wider than the head: refused before any passkey
-    prompt, 'The portal can't widen ... through a rollback', with the host's export and import,
-    and nothing is written". The head here is the rollback to revision 3, so revision 4 (``add``
-    and ``slow`` at allow) is wider."""
+    before any passkey prompt, on the line under **History**'s list, 'Rolling back to revision N
+    brings back client ci-runner, removed in revision M: only the host can, with zoeymcp policy
+    rollback and --allow-revive.', and nothing is written"; and a rollback "now wider than the
+    head: refused before any passkey prompt, on the same line, 'The portal can't widen ...
+    through a rollback', with the host's export and import, and nothing is written". The head
+    here is the rollback to revision 3, so revision 4 (``add`` and ``slow`` at allow) is
+    wider."""
     rig = history_rig
     passkeys = set_up(page, rig)
     open_section(page, "Policy")
@@ -949,10 +952,10 @@ def test_item_22_a_second_browser_pausing_first_draws_the_page_again(
     connector_rig: PortalRig, page: Page, other_context: BrowserContext
 ) -> None:
     """Item 22's last line: "a second browser signed in on the same origin pauses it first: this
-    browser's **Resume** draws the page again, saying the policy moved to revision N since it
+    browser's **Pause** draws the page again, saying the policy moved to revision N since it
     showed revision M ('press the connector's button again'), and nothing more is written".
-    This browser shows the connector sending, so its button is **Pause**: pressed after the
-    other browser's pause, it draws the page again and plans nothing."""
+    This browser still shows the connector sending: its **Pause**, pressed after the other
+    browser's, draws the page again and plans nothing."""
     rig = connector_rig
     passkeys = set_up(page, rig)
     open_section(page, "Policy")
@@ -1030,22 +1033,24 @@ def gives(page: Page, row: Locator) -> Locator:
 def test_item_23_onboarding_in_managed_mode_takes_one_passkey_a_step(
     boarding: Onboarding, page: Page, context: BrowserContext, watch: Watch
 ) -> None:
-    """Item 23: "**Add a server by URL** with ... client ID ``public-check`` and no secret (a
-    public client): the row reads 'Discovered, nothing sent or stored yet', and the plan's one
-    button, like the row's, is **Save**, with no registration and no passkey prompt before it;
-    **Cancel** it (nothing is written)"; with no client ID, "the plan's one button is **Register
-    its client**; registered with a passkey, the page shows no fragment, and the row reads
-    ``needs_save`` with **Save**; no text says to commit, reload, generate or make a fragment";
-    "**Save**: the dialog's first row reads 'Revision 2, from 1 (by the seed, ...: 1 is the
-    head)', then ``credentials.notes``, ``routes.notes`` and ``gateway.servers.notes``, each
-    'added (wider)', and 'No restart needed'; confirmed, the row reads ``needs_connect``";
-    "**Connect**: the provider sends the tab back to the portal, a passkey confirms, and the page
-    queues the server's review by itself; Home's attention list names the tools nobody reviewed,
-    with **Review**; the row, not reviewed yet, already has **Give to clients**"; "the review,
-    ``echo`` included as allow and ``add`` as approve, **Save**: the answer ends 'Then give notes
-    to each client that should reach it: Give to clients, on the MCP servers page', and the row
-    reads reviewed, served to no client yet; Home's list no longer names notes"; **Give to
-    clients**, ``agent1`` ticked and saved: served to ``agent1``; and "the vault's log has
+    """Item 23: "**Add a server by URL** with ... **Client ID** ``public-check`` and no secret (a
+    public client), then **Discover**: the row reads 'Discovered, nothing sent or stored yet',
+    and the plan's one button, like the row's, is **Save**, with no registration and no passkey
+    prompt before it; **Cancel this onboarding** (nothing is written)"; with no client ID, "the
+    plan's one button is **Register its client**; registered with a passkey, the page shows no
+    fragment, and the row reads 'Registered, its credential, route and server not saved yet'
+    (``needs_save``) with **Save**; no text says to commit, reload, generate or make a
+    fragment"; "**Save**: the dialog's first row reads 'Revision 2, from 1 (by the seed, ...: 1
+    is the head)', then ``credentials.notes``, ``routes.notes`` and ``gateway.servers.notes``,
+    each 'added (wider)', and 'No restart needed'; confirmed, the row reads 'In the policy, not
+    connected yet' (``needs_connect``)"; "**Connect** ...: the provider sends the tab back to
+    the portal, a passkey confirms, and the page queues the server's review by itself; Home's
+    attention list names the tools nobody reviewed, with **Review**; the row, not reviewed yet,
+    already has **Give to clients**"; "the review, ``echo`` included as allow and ``add`` as
+    approve, **Save**: the line under the review's buttons ends 'Then give notes to each client
+    that should reach it: Give to clients, on the MCP servers page', and the row reads Reviewed,
+    served to no client yet; Home's list no longer names notes"; **Give to clients**,
+    ``agent1`` ticked and saved: served to ``agent1``; and "the vault's log has
     ``step_up_confirmed`` with ``onboard.register``, ``policy.save``, ``oauth.complete``,
     ``policy.save`` and ``client.servers``, in that order"."""
     rig = boarding.rig
@@ -1142,8 +1147,8 @@ def test_item_23_give_to_clients_closes_takes_away_and_meets_a_second_browser(
     again, the dialog shows ``notes removed`` and no row ending '(wider)'"; and "**Give to
     clients** with the boxes shown, while a second browser signed in on the same origin gives
     notes to ``agent1`` first: this browser's ``agent1`` ticked and **Save** is refused before any
-    passkey prompt ('press Save again to plan it on revision N'), the boxes are drawn again with
-    ``agent1`` ticked, and nothing more is written"."""
+    passkey prompt ('press Save again to plan it on revision N', on the line under the servers),
+    the boxes are drawn again with ``agent1`` ticked, and nothing more is written"."""
     rig = giving
     passkeys = set_up(page, rig)
     open_section(page, "MCP servers")

@@ -224,15 +224,15 @@ def test_item_13_the_provider_sends_the_tab_back_and_a_passkey_connects(
     world: World, page: Page, context: BrowserContext, watch: Watch
 ) -> None:
     """Item 13: "On **Credentials**, choose **Connect** on ``notes``: the dialog says the provider
-    sends the tab back to the portal. Open the link and approve. Pass: the request to
+    sends the tab back to the portal. Open the link and approve. Pass: ... the request to
     ``/oauth/callback/notes`` carries ``Sec-Fetch-Site: cross-site``, ``Sec-Fetch-Mode:
     navigate`` and ``Sec-Fetch-Dest: document``, the cookie ``zoeymcp-8081-cb``...; the tab ends
     on ``/callback/received``, and the back button doesn't return to the address that held the
     code ...; within a few seconds the portal's tab asks for the passkey, its summary saying where
     and when the sign-in came back and 'Confirm only if you have just finished approving in the
     provider's tab; if you haven't, cancel.'; confirm, and **Credentials** shows ``notes``
-    connected." The provider answers at once (no consent page), so the session cookie's line is
-    the consent test's."""
+    connected (its row tagged OK)." The provider answers at once (no consent page), so the
+    session cookie's line is the consent test's."""
     rig = world.rig
     passkeys = set_up(page, rig)
     link = connect(page)

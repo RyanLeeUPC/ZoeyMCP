@@ -1349,6 +1349,35 @@ def test_a_target_whose_parent_is_gone(tmp_path: Path) -> None:
         assert head(rig)["tools"]["include"] == ["list", "get"]
 
 
+def test_a_target_whose_parent_was_pruned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """D-236, D.8, H.3 (15b's review F1): the oldest kept revision, its parent pruned (two
+    kept here, 64 in production). Its changes can't be shown: the diff is ``409
+    revision_unknown`` naming the parent; the history has no gap row, so ``policy.js`` draws
+    **Roll back** for it as for any kept revision but the head; and rolling back to it is
+    planned and written."""
+    monkeypatch.setattr("zoeymcp.vault.policystore.KEEP", 2)
+    monkeypatch.setattr("zoeymcp.vault.managed.KEEP", 2)
+    with world_of(tmp_path, managed(**entry([LIST]))) as world:
+        rig = world.rig
+        assert (host_import(rig, included(GET)), host_import(rig, included(GET, OLD))) == (2, 3)
+        assert not (rig.state / revision_file(1)).exists()
+        page = history(world)
+        assert page["head"] == 3
+        assert [(e["revision"], e["gap"]) for e in page["revisions"]] == [(3, False), (2, False)]
+        assert page["next"] is None
+        unshown = world.page.fetch("GET", "/api/policy/revisions/2")
+        assert status_reason(unshown) == (409, "revision_unknown")
+        assert unshown.json()["error"] == "Revision 1 is no longer kept, or never was."
+        held = roll_back(world, 2, base=page["head"])
+        assert held.status_code == 200, held.text
+        assert held.json()["summary"][0][1].startswith("4, from 3: the content of revision 2")
+        done = confirmed(world, held.json())
+        assert done.status_code == 200, done.text
+        assert revision(rig) == 4
+        assert head(rig)["tools"]["include"] == ["list", "get"]
+        assert [e["revision"] for e in history(world)["revisions"]] == [4, 3]
+
+
 def test_a_rollback_on_a_moved_head(tmp_path: Path) -> None:
     """G.7, N.2, Y8: a rollback prepared on revision 2 meets the host's import of revision 3 at
     the confirm: ``409 changed``, its first row the head that moved, worded for the Policy page

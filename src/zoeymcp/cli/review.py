@@ -479,8 +479,11 @@ NOT_FRESH: Final = (
 
 def summary(status: dict[str, Any]) -> tuple[list[str], int]:
     """``review`` with no server: one line per server, from the gateway's status, with the
-    tools it lists that nobody reviewed under it. Exit 1 when any server needs the operator, the
-    attention decision's not being quiet included (J.5)."""
+    tools it lists that nobody reviewed under it. Exit 1 when any server needs the operator by
+    ``review <server>``'s rule (:func:`exit_code`): an included tool that doesn't match, a drift
+    mark, or the attention decision's not being quiet (J.5). A tool listed invalid or duplicate
+    is counted on the line either way; it needs the operator only when it is included, where
+    the decision names it drifted, since one nobody included is never served (D-234)."""
     lines: list[str] = []
     code = EXIT_CLEAN
     for name, server in sorted(status["servers"].items()):
@@ -497,7 +500,7 @@ def summary(status: dict[str, Any]) -> tuple[list[str], int]:
         counts = {kind: len(reports.get(kind, [])) for kind in ("drift", "missing", "invalid")}
         counts["unreviewed"] = len(reports.get("unreviewed", []))
         marked = len(server["marked"])
-        if marked or counts["drift"] or counts["missing"] or counts["invalid"]:
+        if marked or counts["drift"] or counts["missing"]:
             code = EXIT_NEEDS_OPERATOR
         ago = server["listed_s_ago"]
         listed = "never listed" if ago is None else f"listed {round(ago)} s ago"
@@ -518,7 +521,9 @@ def summary(status: dict[str, Any]) -> tuple[list[str], int]:
 
 
 def _toolkit_summary(name: str, server: dict[str, Any]) -> tuple[str, bool]:
-    """One summary line for a toolkit server, and whether it needs the operator."""
+    """One summary line for a toolkit server, and whether it needs the operator: a drift mark,
+    or an included tool that isn't exposed (drifted, missing, invalid, or hidden by the
+    classification floor), as ``review <server>``'s ``clean`` reads its entries (D-234)."""
     if server["state"] != "loaded":
         return f"{name}  toolkit unavailable ({server.get('reason', 'unknown')})", True
     reports = server.get("reports", {})
@@ -529,7 +534,7 @@ def _toolkit_summary(name: str, server: dict[str, Any]) -> tuple[str, bool]:
         f"drift {counts['drift']}  marked {marked}  missing {counts['missing']}  "
         f"invalid {counts['invalid']}  pinning {server['pinning']}"
     )
-    return line, bool(marked or any(counts.values()))
+    return line, bool(marked) or server["exposed"] < server["included"]
 
 
 def _status_head(name: str, entry: dict[str, Any]) -> str | None:

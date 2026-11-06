@@ -396,8 +396,15 @@ class EgressTransport(httpx2.AsyncBaseTransport):
         await self._inner.aclose()
 
 
+# How long the link keeps an idle connection (D-228): below the vault's listeners' keep-alive,
+# uvicorn's default 5 s, so no request goes out on a connection the vault is closing just then.
+# Nothing on the link is retried (retries=0; a held forward never is, M8 design H3).
+LINK_KEEPALIVE = 4.0
+
+
 def _inner_transport(link: Link) -> httpx2.AsyncHTTPTransport:
-    return httpx2.AsyncHTTPTransport(uds=link.uds, trust_env=False, retries=0)
+    limits = httpx2.Limits(keepalive_expiry=LINK_KEEPALIVE)
+    return httpx2.AsyncHTTPTransport(uds=link.uds, trust_env=False, retries=0, limits=limits)
 
 
 def _key_hook(keys: KeySource) -> Callable[[httpx2.Request], object]:

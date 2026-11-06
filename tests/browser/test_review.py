@@ -213,9 +213,11 @@ def test_item_16_hostile_server_text_shows_as_text_under_trusted_types(
 def test_item_17_copy_puts_exactly_the_shown_fragment_on_the_clipboard(
     boarding: Onboarding, page: Page, context: BrowserContext
 ) -> None:
-    """Item 17: "Add ``https://mcp.notes.example:9444/mcp`` by URL, 'This server is on my
-    network' unticked, with no client ID. Make fragment 1, then choose **Copy** and paste ...
-    Pass: the pasted text is the shown text, line for line and character for character, the
+    """Item 17: "On **MCP servers**, under **Add a server by URL**, enter
+    ``https://mcp.notes.example:9444/mcp``, leave **This server is on my network** unticked and
+    **Client ID** (under **More options**) empty, and choose **Discover**; the plan's **Register
+    and make the YAML** (a passkey) makes fragment 1. Choose **Copy** and paste ... Pass: the
+    pasted text is the shown text, line for line and character for character, the
     2,048-character URL whole on its line; the same after choosing the compose indent", the
     provider's authorization endpoint 2,048 characters long. Fragment 2's copy is item 18's
     test, after its review."""

@@ -65,10 +65,11 @@ def set_up(
     origin: str = "",
     passkeys: CdpAuthenticator | None = None,
 ) -> CdpAuthenticator:
-    """The first visit, as item 11 runs it: **I have a setup code**, a fresh code, the passkey's
-    name, **Create the passkey**, then **Sign in with the new passkey**; on the rig's origin
-    unless ``origin`` names another of its origins, with a new authenticator unless ``passkeys``
-    is the page's already. Returns the page's authenticator, which holds the new passkey."""
+    """The first visit, as item 11 runs it: **I have a setup code**, a fresh code, **Use this
+    code**, the passkey's name, **Create the passkey**, then **Sign in with the new passkey**;
+    on the rig's origin unless ``origin`` names another of its origins, with a new
+    authenticator unless ``passkeys`` is the page's already. Returns the page's authenticator,
+    which holds the new passkey."""
     passkeys = passkeys or CdpAuthenticator(page)
     origin = origin or rig.origin
     open_portal(page, origin)

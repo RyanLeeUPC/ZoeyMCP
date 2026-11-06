@@ -969,7 +969,8 @@ decline a tool, the snippet replaces that block whole too (an included tool leav
 server later changes a declined tool's definition, its pin no longer matches and it counts again.
 
 `review` exits 0 when every included tool matches its pin, nothing is marked and every listed tool
-is included or declined, 1 when something needs you, and 2 when it couldn't run (the gateway is down, the server is unknown, the
+is included or declined, 1 when something needs you (a tool listed invalid or more than once
+that nobody included is shown and needs nothing: it is never served), and 2 when it couldn't run (the gateway is down, the server is unknown, the
 vault refused, the upstream failed or a listing limit was hit) or an option
 doesn't fit what it found. The message says which. `--format json` prints the same, with the
 snippet as a list of lines.
@@ -1573,7 +1574,9 @@ notes  remote  ready  era modern  connections 1  exposed 2/2
 ```
 
 `zoeymcp review` with no server prints one line per server from the same data, and exits 1 if
-anything is drifted, marked, missing or invalid, or listed and nobody reviewed it. Neither makes
+an included tool is drifted, marked, missing or invalid, or a tool is listed and nobody reviewed
+it, as `zoeymcp review <server>` would for that server. The line counts every invalid tool, but
+one nobody included needs nothing. Neither makes
 an upstream call, and neither shows definitions or token hashes. `--format json` for both; its
 `policy_mode` is the mode the vault last stated beside the view, `managed` or `declarative`, or
 `unknown` before the gateway's first view (§11).
@@ -1593,6 +1596,9 @@ reads it: it is shown, labelled as what the gateway reports.
   `server_blocked`, `server_listing_invalid`, `gateway_status_stale`; §3), each with
   `run: zoeymcp review <server>`. `review`'s exit code, these findings and the portal's list
   come from the one decision, so a server `review <server>` exits 1 for has a finding here.
+  `server_listing_invalid` is the one finding outside it: it also counts tools listed invalid
+  that nobody included, which `review` shows and doesn't exit 1 for, since they are never
+  served; it is a warning, so `health` exits 1 for it only with `--strict`.
 - **The portal's Home page** lists the same, per server, under the checklist: drifted, missing
   and marked tools, the tools nobody reviewed, then the same for each kind of prompt and resource
   the server enables, a blocked server, and a bridge's state while it isn't ready, each with

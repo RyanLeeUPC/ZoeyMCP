@@ -184,14 +184,14 @@ def test_item_25_a_hostile_text_is_shown_whole_under_trusted_types(
 ) -> None:
     """Item 25 and the brief's row 1: held calls whose arguments carry markup and quotes, a
     300-character line, a line that reads like the frame inside the JSON, nested JSON and bare
-    addresses, and a relayed prompt: "each waiting row opens to its whole text", the ``pre``'s
-    ``textContent`` exactly the vault's, and so the confirm dialog's summary, "the long line
-    wrapped and not cut", "the relayed row carries 'Relayed from the gateway' and the vault's line
-    at the top of its text", "the imitation never appears; no Trusted Types or Content Security
-    Policy violation", and no dialog or stray request. What the vault refuses before anyone is
-    asked is never listed: the fakes' hidden characters (no hidden character is shown, so none is
-    shown as a mark), a value past the text budget, and a relayed text with a line imitating the
-    vault's relay line."""
+    addresses, and a relayed prompt: "**Open** on each waiting row shows its whole text", the
+    ``pre``'s ``textContent`` exactly the vault's, and so the confirm dialog's summary, "the long
+    line wrapped and not cut", "the relayed row carries 'Relayed from the gateway' and the
+    vault's line at the top of its text", "the imitation never appears; no Trusted Types or
+    Content Security Policy violation", and no dialog or stray request. What the vault refuses
+    before anyone is asked is never listed: the fakes' hidden characters (no hidden character is
+    shown, so none is shown as a mark), a value past the text budget, and a relayed text with a
+    line imitating the vault's relay line."""
     set_up(page, stack.rig)
     hold(stack, "0000000000002501", SHOWN)
     relayed = stack.relay("0000000000002502", {"order": 7, "why": "<b>late</b>"})
@@ -232,15 +232,16 @@ def test_item_25_a_hostile_text_is_shown_whole_under_trusted_types(
 def test_item_26_approve_shows_the_whole_text_before_the_passkey_and_sends_it_once(
     raced: QueueStack, page: Page
 ) -> None:
-    """Item 26 and the brief's row 2: **Approve** opens the dialog with "the whole text and
-    'Approve runs this one call, exactly as shown.'" before any passkey prompt (no
-    ``credentialAsserted`` before the click); "one passkey prompt; the answer is 200"; the row
-    "moves to **Decided
+    """Item 26 and the brief's row 2: "**Open** a row and choose **Approve**. Pass: the dialog
+    shows the whole text and 'Approve runs this one call, exactly as shown.'" before any passkey
+    prompt (no ``credentialAsserted`` before the click); "one passkey prompt; the answer is
+    200"; the row "moves to **Decided
     recently** reading 'approved here HH:MM UTC; sent: ok'"; the upstream gets exactly the held
     bytes, once; "the log has ``step_up_confirmed`` with ``approval.decide``, then
-    ``approval_decided`` with ``via: portal``"; "the fake's message for that ref becomes '...:
-    decided in the portal' with no buttons" (the fake Bot API's message, edited); and the
-    Ledger page lists the vault's records of the call, each written by the vault."""
+    ``approval_decided`` with ``via: portal``"; "the fake's message for that ref becomes
+    'Approval request <ref>: approved HH:MM UTC in the portal. Sent: ...' with no buttons" (the
+    fake Bot API's message, edited); and the Ledger page lists the vault's records of the call,
+    each written by the vault."""
     stack = raced
     passkeys = set_up(page, stack.rig)
     ref = "0000000000002601"
@@ -285,10 +286,11 @@ def test_item_26_approve_shows_the_whole_text_before_the_passkey_and_sends_it_on
 
 
 def test_item_27_a_cancelled_passkey_prompt_decides_nothing(stack: QueueStack, page: Page) -> None:
-    """Item 27 and the brief's row 3: **Approve**, then the passkey prompt cancelled (user
-    verification off, so the browser's ceremony fails with ``NotAllowedError``, as a cancelled
-    prompt does): "nothing is decided, the row stays under **Waiting**, no ``approval_decided``
-    line" and no ``step_up_confirmed``; "**Approve** again works"."""
+    """Item 27 and the brief's row 3: "**Open** a waiting row, choose **Approve** and **Confirm
+    with your passkey**", then the passkey prompt cancelled (user verification off, so the
+    browser's ceremony fails with ``NotAllowedError``, as a cancelled prompt does): "nothing is
+    decided, the row stays under **Waiting**, no ``approval_decided`` line" and no
+    ``step_up_confirmed``; "**Approve** again works"."""
     passkeys = set_up(page, stack.rig)
     ref = "0000000000002701"
     hold(stack, ref)
@@ -410,9 +412,9 @@ def test_item_28_an_approval_replaces_a_change_prepared_in_another_tab(
 
 
 def test_item_29_deny_needs_no_passkey_and_sends_nothing(stack: QueueStack, page: Page) -> None:
-    """Item 29's first lines and the brief's row 3: **Deny** a waiting row: "no passkey
-    prompt, the row moves to Decided recently as denied ... nothing reaches the fake
-    upstream"."""
+    """Item 29's first lines and the brief's row 3: "**Open** a waiting row and choose
+    **Deny**": "no passkey prompt, the row moves to Decided recently as denied ... nothing
+    reaches the fake upstream"."""
     passkeys = set_up(page, stack.rig)
     ref = "0000000000002901"
     hold(stack, ref)
@@ -633,13 +635,13 @@ def test_item_33_home_lists_the_waiting_calls_and_the_starts_findings(
     stack: QueueStack, page: Page
 ) -> None:
     """Item 33: "With two calls waiting, Home lists '2 approvals waiting: the oldest must be
-    answered by HH:MM UTC' with **Open the queue**, and the nav's Approvals entry shows 2; with
-    no gateway status report ... the item still shows", and with one (kept as the gateway's
-    status path keeps it) the item stays. What a start's recovery closed
-    (``approvals_withdrawn_at_start``, cleared by opening Approvals, and
-    ``approvals_outcome_unknown`` naming the ref) shows on Home's checklist: the recovery's
-    result set on the vault's chain stands in for a killed vault's, whose kill and restart
-    ``tests/acceptance/test_held_crash.py`` runs (Linux, processes)."""
+    answered by HH:MM UTC' with **Open the queue**, and the nav's Approvals entry shows 2 in its
+    badge (its accessible name 'Approvals (2)'); with no gateway status report ... the item
+    still shows", and with one (kept as the gateway's status path keeps it) the item stays.
+    What a start's recovery closed (``approvals_withdrawn_at_start``, cleared by opening
+    Approvals, and ``approvals_outcome_unknown`` naming the ref) shows on Home's checklist: the
+    recovery's result set on the vault's chain stands in for a killed vault's, whose kill and
+    restart ``tests/acceptance/test_held_crash.py`` runs (Linux, processes)."""
     set_up(page, stack.rig)
     hold(stack, "0000000000003301")
     hold(stack, "0000000000003302", client="nightly")

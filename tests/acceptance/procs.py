@@ -11,7 +11,9 @@ the managed policy store holds after a write until it is killed (``tests/fakes/p
 M6 design O.1). ``lit`` lit M8's dark policy fields until step 18 turned them on; its slot
 stays and does nothing, as ``tests/dark.py``'s ``lit()`` does (M8 design A.2 row 0, G-2). A
 hooks file made by :func:`telegram_hooks` also sends ``api.telegram.org`` to the fake Bot API
-(``run_telegram.py``, M8 design BP-9) and gives the Telegram surface short timings (BP-10). All
+(``run_telegram.py``, M8 design BP-9) and gives the Telegram surface short timings (BP-10). A
+hooks file with ``review_start_grace`` sets the vault's review start grace (``vault/reviewjobs.py``,
+45 s) for a vault no gateway polls, whose queued review is then refused at once (D-210). All
 happen in the launcher below, never in ZoeyMCP's code.
 
 :class:`ManagedVault` is a managed vault on one state directory, started, killed and started
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -34,7 +37,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 # argv: the CA file or "", the hooks file (tests/fakes/resolver.py's FakeResolver.save, with the
-# Telegram surface's timings under "telegram" when telegram_hooks made it) or "",
+# Telegram surface's timings under "telegram" when telegram_hooks made it, and the review start
+# grace under "review_start_grace" when a test sets it) or "",
 # the bridges' sockets directory (tests/fakes/resolver.py's install_sockets) or "", the policy
 # store's holds file (tests/fakes/policyholds.py's save) or "", "lit" or "" (read by nothing since
 # M8 step 18 turned the dark fields on), then zoeymcp's own arguments.
@@ -49,10 +53,14 @@ if sys.argv[2]:
     import json
     from tests.fakes.resolver import install
     install(sys.argv[2])
-    timings = json.loads(open(sys.argv[2], "rb").read()).get("telegram")
+    hooked = json.loads(open(sys.argv[2], "rb").read())
+    timings = hooked.get("telegram")
     if timings:
         from zoeymcp.vault import telegram
         telegram.TIMINGS = telegram.Timings(**timings)
+    if "review_start_grace" in hooked:
+        from zoeymcp.vault import reviewjobs
+        reviewjobs.REVIEW_START_GRACE = hooked["review_start_grace"]
 if sys.argv[3]:
     from tests.fakes.resolver import install_sockets
     install_sockets(sys.argv[3])
@@ -92,11 +100,43 @@ def telegram_hooks(
     return path
 
 
+# free_port's ports (D-256): above the well-known ports, outside the range the kernel hands out
+# itself, and never one this run has handed out already.
+PORTS_FROM = 20000
+_handed: set[int] = set()
+_pick = random.Random()  # noqa: S311 - spreading ports, not a secret
+
+
+def ephemeral_ports() -> range:
+    """The ports the kernel gives a socket bound to port 0 or connecting out: Linux's
+    ``ip_local_port_range``, else the IANA dynamic range (Windows' and macOS's default)."""
+    try:
+        text = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text(encoding="ascii")
+        low, high = (int(part) for part in text.split())
+    except (OSError, ValueError):
+        low, high = 49152, 65535
+    return range(low, high + 1)
+
+
 def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port: int = probe.getsockname()[1]
+    """A port nothing listens on now, for a process to bind later (D-256). Probing port 0 handed
+    out a port from the kernel's ephemeral range, which the kernel could then give to any other
+    socket before the process bound it (a fake's port-0 listener, or a connection's own end),
+    and the process failed ``Address already in use``. This picks outside that range instead, so
+    only another explicit bind can take it, and never the same port twice in a run."""
+    ephemeral = ephemeral_ports()
+    spare = [
+        port for port in range(PORTS_FROM, 65536) if port not in ephemeral and port not in _handed
+    ]
+    for port in _pick.sample(spare, min(len(spare), 64)):
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:  # in use, or reserved (Windows' excluded port ranges)
+                continue
+        _handed.add(port)
         return port
+    raise RuntimeError("no free port outside the ephemeral range")
 
 
 def own_uid() -> int:

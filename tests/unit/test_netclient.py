@@ -1060,6 +1060,114 @@ async def test_a_local_route_never_goes_through_egress_proxy(
     assert isinstance(pool._network_backend, netclient.GuardedBackend)
 
 
+# --- D-228: an idle pooled connection, dropped before its server's keep-alive closes it ----------
+
+
+@asynccontextmanager
+async def keepalive_server(idle: float) -> AsyncIterator[tuple[int, list[str]]]:
+    """A plain-http server on loopback that keeps a connection alive ``idle`` seconds after an
+    answer, at its worst (D-228): a request on a connection idle that long arrives just as the
+    server closes it, so it is closed unanswered, never seen closed before. What happened, in
+    order: ``open`` per connection, ``answered`` per answer, ``closed`` per request closed on."""
+    seen: list[str] = []
+    writers: list[asyncio.StreamWriter] = []
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        seen.append("open")
+        writers.append(writer)
+        last = asyncio.get_running_loop().time()
+        try:
+            while True:
+                head = await reader.readuntil(b"\r\n\r\n")
+                length = next(
+                    (
+                        int(line.split(b":", 1)[1])
+                        for line in head.split(b"\r\n")
+                        if line.lower().startswith(b"content-length:")
+                    ),
+                    0,
+                )
+                await reader.readexactly(length)
+                if asyncio.get_running_loop().time() - last >= idle:
+                    seen.append("closed")
+                    return
+                writer.write(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                await writer.drain()
+                seen.append("answered")
+                last = asyncio.get_running_loop().time()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            return
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    async with server:
+        try:
+            yield int(server.sockets[0].getsockname()[1]), seen
+        finally:
+            for writer in writers:  # the server's close waits for every connection's
+                writer.close()
+
+
+def test_every_pool_keeps_an_idle_connection_below_a_common_servers_keep_alive() -> None:
+    """D-228: 4 s, below uvicorn's default 5 s (also Node's and Apache's), for every client a
+    route, a token or an onboarding goes on, direct or through the egress proxy."""
+    import uvicorn
+
+    assert netclient.POOL_KEEPALIVE == 4.0
+    assert uvicorn.Config(app="unused:app").timeout_keep_alive > netclient.POOL_KEEPALIVE
+
+
+async def test_each_clients_pool_has_the_keep_alive(tmp_path: Path) -> None:
+    timeout = httpx.Timeout(10.0)
+    expiry = netclient.POOL_KEEPALIVE
+    direct = netclient.route_client(None, lambda: (), timeout=timeout)
+    proxied = netclient.route_client("http://127.0.0.1:3128", lambda: (), timeout=timeout)
+    local = netclient.local_client(timeout=timeout)
+    sockets = netclient.SocketClients({"fetch": 10001}, timeout=timeout)
+    bridge = sockets("fetch")
+    assert bridge is not None
+    try:
+        assert direct._transport._shared._pool._keepalive_expiry == expiry  # type: ignore[attr-defined]
+        assert proxied._transport._pool._keepalive_expiry == expiry  # type: ignore[attr-defined]
+        assert local._transport._pool._keepalive_expiry == expiry  # type: ignore[attr-defined]
+        assert bridge._transport._pool._keepalive_expiry == expiry  # type: ignore[attr-defined]
+    finally:
+        for client in (direct, proxied, local):
+            await client.aclose()
+        await sockets.aclose()
+
+
+@pytest.mark.parametrize(("kept", "answered"), [(0.4, True), (5.0, False)])
+async def test_a_request_never_goes_on_a_connection_its_server_is_closing(
+    fake: FakeResolver, monkeypatch: pytest.MonkeyPatch, kept: float, answered: bool
+) -> None:
+    """D-228, a tenth the size: a server that keeps a connection alive 0.5 s (uvicorn's 5 s) and
+    a pool that keeps one 0.4 s (POOL_KEEPALIVE's 4 s). A request after 0.6 s idle goes on a new
+    connection and is answered. Kept 5 s, as httpx's default did, it goes on the one the server is
+    closing just then and fails, since nothing is retried."""
+    monkeypatch.setattr(netclient, "POOL_KEEPALIVE", kept)
+    async with keepalive_server(0.5) as (port, seen):
+        fake.serve("upstream-mcp", port, address="127.0.0.1")
+        client = netclient.local_client(timeout=httpx.Timeout(10.0))
+        try:  # closed before the server, which waits for its connections to close
+            with anyio.fail_after(10):
+                first = await client.get("http://upstream-mcp:9000/mcp")
+                await anyio.sleep(0.6)
+                if answered:
+                    second = await client.get("http://upstream-mcp:9000/mcp")
+                    assert (first.text, second.text) == ("ok", "ok")
+                else:
+                    with pytest.raises(httpx.RemoteProtocolError):
+                        await client.get("http://upstream-mcp:9000/mcp")
+        finally:
+            await client.aclose()
+    if answered:
+        assert seen == ["open", "answered", "open", "answered"]
+    else:
+        assert seen == ["open", "answered", "closed"]
+
+
 async def test_the_local_client_is_direct_and_guarded(tmp_path: Path) -> None:
     app = bridges_vault(tmp_path, bridges_policy({"fetch": "http://bridge:9000"}))
     client = app._local_client

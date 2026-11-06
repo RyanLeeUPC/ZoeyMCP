@@ -109,9 +109,10 @@ def connect_demo(page: Page) -> None:
 def test_item_8_a_rename_shows_its_summary_first_and_a_cancelled_prompt_changes_nothing(
     rig: PortalRig, page: Page, watch: Watch
 ) -> None:
-    """Item 8: "With two passkeys enrolled, open **Passkeys**, choose **Rename** on one and give a
-    new name. Pass: the dialog shows what the vault will do (the passkey, its name now, the new
-    name) before any passkey prompt; choose **Confirm with your passkey** and cancel the
+    """Item 8: "With two passkeys enrolled, open **Passkeys**, choose **Rename** in one passkey's
+    row, type a name in **New name**, which opens in that row, and choose the row's **Rename**.
+    Pass: the dialog shows what the vault will do (the passkey, its name now, the new name)
+    before any passkey prompt; choose **Confirm with your passkey** and cancel the
     browser's prompt: the dialog says the prompt was cancelled, **Close** it, and the passkey
     keeps its name (no ``passkey_renamed`` in the log)." The second passkey is enrolled from the
     page on a second authenticator (D-144's "a second authenticator", in virtual form); the
@@ -160,8 +161,9 @@ def test_item_8_a_mismatched_paste_is_refused_with_no_prompt(
     rig: PortalRig, page: Page, watch: Watch
 ) -> None:
     """Item 8's second part: "open **Credentials**, choose **Connect** on ``demo``, paste
-    ``http://127.0.0.1/callback?code=x&state=wrong`` and choose **Check the address**. Pass: the
-    dialog says the address belongs to another login, and no passkey prompt opens"."""
+    ``http://127.0.0.1/callback?code=x&state=wrong`` into **Paste the address it sends you to**
+    and choose **Check the address**. Pass: the dialog says the address belongs to another
+    login, and no passkey prompt opens"."""
     passkeys = set_up(page, rig)
     connect_demo(page)
     watch.allow(REFUSED_400, on=rig.origin)  # the prepare's refusal, which the browser reports
@@ -179,11 +181,12 @@ def test_item_8_a_mismatched_paste_is_refused_with_no_prompt(
 def test_item_9_the_link_opens_a_tab_with_no_opener_and_no_referrer(
     rig: PortalRig, page: Page, context: BrowserContext, watch: Watch
 ) -> None:
-    """Item 9: "Open **Credentials** and choose **Connect** on ``demo``, then the dialog's link.
-    Pass: it opens example.com in a new tab, and in that tab's console ``window.opener`` is
-    ``null``; the Network panel shows the request to example.com without a ``Referer`` header.
-    Close the tab and choose **Cancel** in the dialog." The provider's page is answered in the
-    browser (a route), so nothing leaves the machine; the request is as the browser sent it."""
+    """Item 9: "Open **Credentials** and choose **Connect** on ``demo``, then the dialog's link,
+    **Open the provider's sign-in page in a new tab**. Pass: it opens example.com in a new tab,
+    and in that tab's console ``window.opener`` is ``null``; the Network panel shows the request
+    to example.com without a ``Referer`` header. Close the tab and choose **Cancel** in the
+    dialog." The provider's page is answered in the browser (a route), so nothing leaves the
+    machine; the request is as the browser sent it."""
 
     def provider(route: Route) -> None:
         route.fulfill(status=200, content_type="text/html", body="<!doctype html><p>sign in</p>")
