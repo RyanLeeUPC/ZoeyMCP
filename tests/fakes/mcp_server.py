@@ -1786,18 +1786,16 @@ class _Wire:
         if record.rpc_method == "tools/call":
             if session_id is not None:
                 fake._session_calls[session_id] += 1
+                # Expired before this call is answered, not after: the client can send the next
+                # request as soon as it reads this answer, which may be before the handler returns.
+                limit = fake.session_404_after
+                if limit is not None and fake._session_calls[session_id] >= limit:
+                    fake._expired.add(session_id)
             if record.params.get("name") == "echo" and await self._wire_call(record, send):
                 return
         await self.manager.handle_request(scope, receive, send)
         if method == "DELETE" and session_id is not None:
             fake._sessions.pop(session_id, None)
-        limit = fake.session_404_after
-        if (
-            session_id is not None
-            and limit is not None
-            and fake._session_calls[session_id] >= limit
-        ):
-            fake._expired.add(session_id)
 
     def _presented(self, scope: Scope) -> tuple[str | None, bool]:
         """The value presented (for a 401 echo), and whether it's the key in the right form.
