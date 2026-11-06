@@ -78,6 +78,7 @@ import argparse
 import contextlib
 import json
 import os
+import shlex
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -321,6 +322,8 @@ def _usage(action: str, args: argparse.Namespace, out: TextIO) -> str | None:
         if args.yes and args.to is None:
             return "with --yes, give the revision with --to N: the number is never taken unseen"
         return None
+    if action == "seed" and args.source is not None and args.config is not None:
+        return "give the policy as FILE or as --config FILE, not both"
     if action == "export" and out.isatty() and not args.force_tty:
         return (
             "the export holds placeholders and client token hashes: redirect it to a file "
@@ -464,7 +467,8 @@ def _seed(
     hosted: Commands,
 ) -> int:
     """F.3's ``policy seed --state``: revision 1 on a volume with no store and no anchor."""
-    _, given = _source(args.config, environ, stdin)
+    config = args.source if args.source is not None else args.config
+    _, given = _source(config, environ, stdin)
     if given.mode != "managed":
         raise OfflineRefused("seed_declarative", unreadable=True)
     store = _open(state, keys, previous)
@@ -476,7 +480,7 @@ def _seed(
     _key_state(state, keys, previous, policy)
     err.write("Seeding revision 1 of a new deployment from the policy given:\n")
     err.write(_rows(_summary(given, policy)))
-    if not _confirmed(args.yes, args.config == "-", stdin, err):
+    if not _confirmed(args.yes, config == "-", stdin, err):
         return EXIT_REFUSED
     try:
         committed = store.seed(
@@ -905,9 +909,25 @@ class _Offline:
         self._parked = found.parked is not None
 
     def head(self) -> dict[str, Any]:
-        top = self._store.head
+        """The head as the socket's ``GET /policy`` says it, from the store alone: with the
+        vault stopped there is no gateway report, so no gateway, witness or revision not
+        running (None each)."""
+        top, header = self._store.head, self._store.header
         assert top is not None  # noqa: S101 - an Ok store has one
-        return {"mode": "managed", "revision": top.revision, "deployment8": top.deployment[:8]}
+        assert header is not None  # noqa: S101
+        return {
+            "mode": "managed",
+            "revision": top.revision,
+            "digest8": top.digest.removeprefix("sha256:")[:8],
+            "deployment8": top.deployment[:8],
+            "created": header["created"],
+            "origin": header["origin"],
+            "kind": header["kind"],
+            "author": dict(header["author"]),
+            "witness": None,
+            "gateway": None,
+            "not_running": None,
+        }
 
     def history(self, before: int | None, limit: int | None) -> dict[str, Any]:
         return history_page(self._store, before, limit or HISTORY_PAGE_MAX)
@@ -1130,9 +1150,9 @@ def _act(
     err: TextIO,
 ) -> int:
     if action == "head":
-        return _head(args, vault, out)
+        return _head(args, vault, environ, out)
     if action == "history":
-        return _history(args, vault, out)
+        return _history(args, vault, environ, out)
     if action == "diff":
         return _diff(args, vault, out)
     if action == "export":
@@ -1142,8 +1162,9 @@ def _act(
     return _write(action, args, vault, environ, stdin, err)
 
 
-def _head(args: argparse.Namespace, vault: _Vault, out: TextIO) -> int:
-    """The mode and the head (M.6's first row)."""
+def _head(args: argparse.Namespace, vault: _Vault, environ: Mapping[str, str], out: TextIO) -> int:
+    """The mode and the head (M.6's first row); offline, the store's alone. Its ways on are
+    commands as typed on the host, in the vault's container (D4)."""
     answer = vault.head()
     if args.format == "json":
         write_json(answer, out)
@@ -1157,6 +1178,10 @@ def _head(args: argparse.Namespace, vault: _Vault, out: TextIO) -> int:
     out.write(f"Revision {answer['revision']}, {_who(answer)}, {_shown(answer['kind'])}\n")
     out.write(f"Deployment {answer['deployment8']}, digest {answer['digest8']}\n")
     gateway = answer["gateway"]
+    if gateway is None:
+        out.write("Gateway and witness: not asked (offline, with the vault stopped)\n")
+        return EXIT_OK
+    prefix = Prefix.for_role("vault", environ)
     if gateway["state"] == "unknown":
         out.write("Gateway: unknown (no status report yet)\n")
     elif gateway["revision"] is None:
@@ -1172,13 +1197,14 @@ def _head(args: argparse.Namespace, vault: _Vault, out: TextIO) -> int:
         out.write(f"Witness: the gateway has seen revision {witness['revision']}\n")
     if witness is not None and witness["target"] is not None:
         out.write(
-            f"The gateway's witness shows a restore: see zoeymcp health, then zoeymcp policy "
-            f"acknowledge-restore (revision {witness['target']}).\n"
+            f"The gateway's witness shows a restore (revision {witness['target']}): see "
+            f"{prefix.zoeymcp('health')}, then run: "
+            f"{prefix.zoeymcp('policy', 'acknowledge-restore')}\n"
         )
     if answer["not_running"] is not None:
         out.write(
-            f"Revision {answer['not_running']} is saved but not running: send SIGHUP to the vault "
-            "or restart it.\n"
+            f"Revision {answer['not_running']} is saved but not running: run "
+            f"{prefix.line('', 'hup')}, or restart it: {prefix.line('', 'restart')}\n"
         )
     return EXIT_OK
 
@@ -1199,7 +1225,9 @@ def _who(entry: Mapping[str, Any]) -> str:
     return f"saved {_when(entry['created'])} by {who}"
 
 
-def _history(args: argparse.Namespace, vault: _Vault, out: TextIO) -> int:
+def _history(
+    args: argparse.Namespace, vault: _Vault, environ: Mapping[str, str], out: TextIO
+) -> int:
     """H.1: one line per revision, newest first; a revision in quarantine is a gap."""
     page = vault.history(args.before, args.limit)
     if args.format == "json":
@@ -1220,7 +1248,13 @@ def _history(args: argparse.Namespace, vault: _Vault, out: TextIO) -> int:
             line += f": {_shown(entry['reason'])}"
         out.write(line + "\n")
     if page["next"] is not None:
-        out.write(f"More: zoeymcp policy history --before {page['next']}\n")
+        words = ["policy", "history", "--before", str(page["next"])]
+        if vault.via == "offline":
+            # Offline, the same command again where it ran: the vault is stopped.
+            more = shlex.join(["zoeymcp", *words, "--state", str(args.state)])
+        else:
+            more = Prefix.for_role("vault", environ).zoeymcp(*words)
+        out.write(f"More: {more}\n")
     return EXIT_OK
 
 
@@ -1312,8 +1346,9 @@ def _write(
             "Each store entry it leaves unused can't be revoked at its provider after it: run "
             "these first, or add --revoke-removed:\n"
         )
+        prefix = Prefix.for_role("vault", environ)
         for name in answer["unused"]:
-            err.write(f"  zoeymcp secret delete {_shown(name)}\n")
+            err.write(f"  {_shown(prefix.zoeymcp('secret', 'delete', name))}\n")
     piped = write.text is not None and args.source == "-"
     confirmed = _confirm_write(args, answer, piped, stdin, err)
     if confirmed is None:

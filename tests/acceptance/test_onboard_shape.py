@@ -10,8 +10,8 @@ gateway's review poll is the shipped 25 s one: the vault ends it when a reload c
 so a review queued right after waits out no poll (M6 design K.5).
 
 The operator starts from a policy with an agent and no server, and walks J1 with the real CLI:
-``login --mcp`` (fragment 1), the fragment merged as ``check --with`` merges it, the reload,
-``login --mcp`` again (the comparison, the paste, the review the gateway's poll runs), then the
+``onboard`` (fragment 1), the fragment merged as ``check --with`` merges it, the reload,
+``onboard`` again (the comparison, the paste, the review the gateway's poll runs), then the
 commands its ``Next:`` list prints (``review --via vault --choose --suggest``, an edit, ``review
 --via vault --choices -``: fragment 2), the merge, the server assigned to the agent, the reload.
 Then the agent lists the tools and calls an allowed one and an approved one, and the vault
@@ -142,7 +142,7 @@ PROFILE = "remote-mcp-oauth-discovered.yaml"
 HOUR = 3600.0
 # Every token, code and client secret the fake authorization server issues.
 ISSUED = re.compile(r"fake-notes-(?:rt|at|code|secret)-\d+")
-J1 = ["login", "--mcp", SERVER_URL, "--name", SERVER]
+J1 = ["onboard", SERVER_URL, "--name", SERVER]
 # The prefix every printed command starts with, for the shipped hardened compose file (M.7).
 PREFIX = "docker compose -f deploy/compose.hardened.yaml exec "
 # The tools the operator keeps: the one the server marks read-only, allowed as it suggests, and
@@ -703,7 +703,7 @@ def printed(err: str) -> list[tuple[list[str], str | None, str | None]]:
 
 
 def first_run(s9: S9, argv: list[str], stdin: str = "") -> str:
-    """``login --mcp``: fragment 1 on stdout, and last on its ``Next:`` list, the same command
+    """``onboard``: fragment 1 on stdout, and last on its ``Next:`` list, the same command
     to sign in once it is committed (kept as ``s9.again``, the plan as ``s9.plan``)."""
     code, fragment, err = s9.cli(argv, io.StringIO(stdin))
     assert code == 0, err
@@ -1107,7 +1107,7 @@ async def test_j5_through_the_operators_proxy_resumed_from_the_printed_command(
             assert re.search(r"^    http_access allow \S+ CONNECT zoeymcp_onboard_\d+ ", err, re.M)
             [(argv, source, target)] = printed(err)
             assert (source, target) == (None, f"onboard-{SERVER}-1.yaml")
-            assert "-T vault zoeymcp login --mcp" in err
+            assert "-T vault zoeymcp onboard" in err
             proxy.refuse = allowed
         fragment = first_run(s9, argv, SECRET + "\n")
         s9.commit(fragment)

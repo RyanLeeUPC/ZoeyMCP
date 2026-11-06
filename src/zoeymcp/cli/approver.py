@@ -158,15 +158,21 @@ def _enrol(
     said.write("Confirmed.\n")
     lines = [str(line) for line in confirmed["lines"]]
     applied = None
-    if args.apply and admin_client.policy_head(socket)["mode"] == "managed":
-        applied = _apply(socket, confirmed, lines, stdin, said)
+    prefix = admin_client.Prefix.for_role("vault")
+    mode = admin_client.policy_head(socket)["mode"] if args.apply else None
+    if mode == "managed":
+        applied = _apply(socket, confirmed, lines, stdin, said, prefix)
         if applied is None:
             return EXIT_REFUSED
-    elif args.format == "json":
-        review_view.write_lines([*lines, *RELOAD], said)
     else:
-        review_view.write_lines(lines, out)  # the answer: the lines to add
-        review_view.write_lines(RELOAD, said)
+        if mode is not None:
+            # D17: said, not ignored.
+            said.write(f"--apply only applies in managed mode; this deployment is {mode}.\n")
+        if args.format == "json":
+            review_view.write_lines([*lines, *reload_lines(prefix)], said)
+        else:
+            review_view.write_lines(lines, out)  # the answer: the lines to add
+            review_view.write_lines(reload_lines(prefix), said)
     if args.format == "json":
         review_view.write_json({**confirmed, "revision": applied}, out)
     return EXIT_OK
@@ -199,16 +205,29 @@ def _stop_busy(
 
 
 # A plan with a lockout row isn't applied here: the host imports it, the lines added by hand.
+# Its commands as typed on the host (D4): {export} and {import_}.
 LOCKOUT: Final = (
     "This plan has a lockout row, so nothing was written: add the lines above to an export "
-    "(zoeymcp policy export > policy.yaml), then run zoeymcp policy import - < policy.yaml, "
-    "which shows the row and asks."
+    "({export} > policy.yaml), then run {import_} < policy.yaml, which shows the row and asks."
 )
-# The step after the lines, in declarative mode or without --apply.
+# The step after the lines, in declarative mode or without --apply; {hup} reloads the vault.
 RELOAD: Final = (
-    "Add these lines to the policy, then check it and reload the vault (managed: run this "
-    "again with --apply, or export, edit and import). The reload starts the approver.",
+    "Add these lines to the policy, then check it and reload the vault: {hup} (managed: run "
+    "this again with --apply, or export, edit and import). The reload starts the approver."
 )
+
+
+def lockout_line(prefix: admin_client.Prefix) -> str:
+    """:data:`LOCKOUT` with its export and import as typed on the host."""
+    return LOCKOUT.format(
+        export=prefix.zoeymcp("policy", "export", piped=True),
+        import_=prefix.zoeymcp("policy", "import", "-", piped=True),
+    )
+
+
+def reload_lines(prefix: admin_client.Prefix) -> list[str]:
+    """:data:`RELOAD` with the vault's reload as typed on the host."""
+    return [RELOAD.format(hup=prefix.line("", "hup"))]
 
 
 def opening_lines(opened: Mapping[str, Any]) -> list[str]:
@@ -250,6 +269,7 @@ def _apply(
     lines: Sequence[str],
     stdin: TextIO,
     said: TextIO,
+    prefix: admin_client.Prefix,
 ) -> int | None:
     """G.8 step 5 in managed mode: a host import of the head with the lines, planned, shown and
     asked; the revision written, or None when the host said no (nothing saved)."""
@@ -263,7 +283,7 @@ def _apply(
     rows = [f"  {label}: {value}" for label, value in plan["rows"]]
     review_view.write_lines(rows, said)
     if plan["lockout"]:
-        said.write(f"{LOCKOUT}\n")
+        said.write(f"{lockout_line(prefix)}\n")
         return None
     said.write("Apply as a host import? [y/N] ")
     said.flush()

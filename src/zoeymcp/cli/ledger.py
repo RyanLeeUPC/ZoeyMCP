@@ -5,12 +5,14 @@ line: when it was asked, the ref, the client, ``server/tool``, the era, the deci
 outcome. ``--format json`` prints the records themselves, keyed digests included. Nothing here
 imports the gateway: the CLI may run in the vault's environment.
 
-``zoeymcp ledger --vault`` reads the vault's reported copy instead (M5 design J.5): the rows the
-vault's view makes, each with its sends, and the copy's state; :func:`vault_lines` renders them
-(from M8, a row's records the vault's own chain wrote, the other chain's records, where the
-two chains disagree and the calls only the vault's chain holds, M8 design J.2) and
+``zoeymcp ledger vault`` (or ``ledger --vault``) reads the vault's reported copy instead (M5
+design J.5): the rows the vault's view makes, each with its sends, and the copy's state;
+:func:`vault_lines` renders them (from M8, a row's records the vault's own chain wrote, the other
+chain's records, where the two chains disagree and the calls only the vault's chain holds, M8
+design J.2) and
 :func:`restart_lines` a chain restart's plan. Their strings are the gateway's: the CLI writes
-them through ``review.write_lines``, which shows control characters as text.
+them, and the gateway's own listing too, through ``review.write_lines``, which shows control
+characters as text.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from datetime import UTC, datetime
 from typing import Any, TextIO
 
 from ..common import ledgerjoin
+from .admin_client import Prefix
 from .review import counted
 
 _SINCE = re.compile(r"^([0-9]{1,6})([mhd])$")
@@ -88,11 +91,6 @@ def check_lines(result: dict[str, Any]) -> list[str]:
     return [f"{result['ref']}: these are not the call's arguments"]
 
 
-def write(out: TextIO, rows: Iterable[str]) -> None:
-    for row in rows:
-        out.write(row + "\n")
-
-
 def write_json(out: TextIO, records: Iterable[dict[str, Any]]) -> None:
     for record in records:
         out.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
@@ -100,7 +98,8 @@ def write_json(out: TextIO, records: Iterable[dict[str, Any]]) -> None:
 
 # --- the vault's reported copy (M5 design J.4, J.5) ----------------------------------------------
 
-RESTART_HINT = "after deciding why, run: zoeymcp ledger --vault --restart-chain"
+# A refused report's way on, once the operator has decided why: after the host's prefix (D4).
+RESTART_HINT = "after deciding why, run: {command}"
 # An orphan send's flag (J.5), in words; one this CLI doesn't know is printed as it is.
 ORPHAN_WORDS = {
     "no_ledger_record": "no ledger record holds its call, and the vault's own chain holds no "
@@ -116,9 +115,11 @@ VAULT_ONLY_WORDS = {
 }
 
 
-def vault_lines(page: dict[str, Any]) -> list[str]:
+def vault_lines(page: dict[str, Any], prefix: Prefix | None = None) -> list[str]:
     """The copy's state, then a page of rows oldest first, its orphan sends, the calls only the
-    vault's own chain holds, oldest first, and archives."""
+    vault's own chain holds, oldest first, and archives. Its commands are as typed on the host,
+    in the vault's container (``prefix``, the hardened file's by default, D4)."""
+    prefix = Prefix() if prefix is None else prefix
     state = page["state"]
     if state["head_seq"] is None:
         out = [f"copy: {state['state']}, nothing reported yet"]
@@ -133,7 +134,8 @@ def vault_lines(page: dict[str, Any]) -> list[str]:
         out.append(f"broken: the copy's files stop chaining at seq {state['broken_at']}")
     refused = page.get("refused")
     if refused:
-        out.append(f"refused: {_refusal(refused)}; {RESTART_HINT}")
+        restart = prefix.zoeymcp("ledger", "vault", "--restart-chain")
+        out.append(f"refused: {_refusal(refused)}; {RESTART_HINT.format(command=restart)}")
     if page.get("chain_readable") is False:
         out.append("vault chain: can't be read, so each row is the copy's alone")
     for row in reversed(page["rows"]):
@@ -158,7 +160,8 @@ def vault_lines(page: dict[str, Any]) -> list[str]:
         line = f"archived {epoch['name']}: {_epoch(epoch)}"
         out.append(line + (", files dropped" if epoch["dropped"] else ""))
     if page["next"] is not None:
-        out.append(f"older rows: zoeymcp ledger --vault --before {page['next']}")
+        older = prefix.zoeymcp("ledger", "vault", "--before", str(page["next"]))
+        out.append(f"older rows: {older}")
     if any(_vault_wrote(row) for row in [*page["rows"], *alone]):
         out.append("each row is as reported by the gateway, but for what it says the vault wrote")
     elif page["rows"]:

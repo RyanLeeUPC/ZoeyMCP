@@ -600,7 +600,7 @@ RESOURCE = "https://mcp.music.example/mcp"
 REGISTER_AGAIN = {
     "kind": "onboard_again",
     "credential": "music",
-    "command": f"zoeymcp login --mcp {RESOURCE} --reregister",
+    "command": f"zoeymcp onboard {RESOURCE} --reregister",
 }
 SET_SECRET = {"kind": "set_secret", "credential": "music", "ref": "store:music-secret"}
 REFUSED_TEXT = (

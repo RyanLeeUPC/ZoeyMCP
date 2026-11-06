@@ -15,6 +15,7 @@ import errno
 import io
 import json
 import os
+import shlex
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -77,6 +78,10 @@ def master(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(main_module, "running_as_root", lambda: False)
     return environ
+
+
+# The vault's container as a way out names it, with the compose command left to its default.
+HOST = "docker compose -f deploy/compose.hardened.yaml exec vault"
 
 
 def cli(argv: list[str], stdin: str = "") -> tuple[int, str]:
@@ -202,6 +207,8 @@ def test_seed_asks_first(tmp_path: Path, master: dict[str, str]) -> None:
         "Read the plan above, then run this again with --yes.\n"
     )
     assert not (state / "policy-anchor.json").exists()
+    # D21: the policy as FILE, as import takes it, is the same.
+    assert cli(["policy", "seed", "-", "--state", str(state)], managed_text()) == (code, err)
     code, err = cli(argv, "y\n")
     assert code == 0, err
     assert "Write it? [y/N] Seeded revision 1 of deployment " in err
@@ -1036,6 +1043,53 @@ def test_offline_reads(tmp_path: Path, master: dict[str, str], log_buffer: io.St
     ]
 
 
+def test_offline_head_and_the_next_page(tmp_path: Path, master: dict[str, str]) -> None:
+    """D21: ``policy head`` takes --state like the other reads: the store's head, with the
+    gateway not asked. D4: history's next page is the same command again, --state and all."""
+    state = str(with_two_revisions(tmp_path, master))
+    code, out, err = run_cli(["policy", "head", "--state", state])
+    assert code == 0, err
+    lines = out.splitlines()
+    assert lines[0] == "Mode: managed"
+    assert lines[1].startswith("Revision 2, saved ")
+    assert lines[2].startswith("Deployment ")
+    assert lines[3:] == ["Gateway and witness: not asked (offline, with the vault stopped)"]
+    # The parent's --format, as the head's own (D14).
+    code, out, err = run_cli(["policy", "--format", "json", "head", "--state", state])
+    assert code == 0, err
+    head = json.loads(out)
+    assert (head["mode"], head["revision"]) == ("managed", 2)
+    assert (head["gateway"], head["witness"], head["not_running"]) == (None, None, None)
+    assert set(head) == {
+        "mode",
+        "revision",
+        "digest8",
+        "deployment8",
+        "created",
+        "origin",
+        "kind",
+        "author",
+        "witness",
+        "gateway",
+        "not_running",
+    }
+    code, out, err = run_cli(["policy", "history", "--limit", "1", "--state", state])
+    assert code == 0, err
+    more = shlex.join(["zoeymcp", "policy", "history", "--before", "2", "--state", state])
+    assert out.splitlines()[-1] == f"More: {more}"
+
+
+def test_seed_takes_the_policy_as_file_or_config(tmp_path: Path, master: dict[str, str]) -> None:
+    """D21: seed reads FILE as import does, or --config FILE; not both."""
+    code, err = cli(
+        ["policy", "seed", "a.yaml", "--config", "b.yaml", "--state", str(tmp_path / "s")]
+    )
+    assert (code, err) == (
+        2,
+        "zoeymcp policy seed: give the policy as FILE or as --config FILE, not both\n",
+    )
+
+
 def test_offline_reads_keep_log_lines_off_stdout(
     tmp_path: Path, master: dict[str, str], capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1145,13 +1199,14 @@ def test_offline_refuses_a_parked_or_missing_store(tmp_path: Path, master: dict[
 
 
 OFFLINE_FORMS = [
+    ["policy", "head"],
     ["policy", "history"],
     ["policy", "diff", "1"],
     ["policy", "export"],
     ["policy", "import", "-", "--yes"],
     ["policy", "rollback", "1", "--yes"],
 ]
-OFFLINE_IDS = ["history", "diff", "export", "import", "rollback"]
+OFFLINE_IDS = ["head", "history", "diff", "export", "import", "rollback"]
 
 
 @pytest.mark.parametrize("argv", OFFLINE_FORMS, ids=OFFLINE_IDS)
@@ -1213,8 +1268,8 @@ def test_acknowledge_over_the_socket(
     code, out, _ = run_cli(["policy"])
     assert out.splitlines()[-2:] == [
         "Witness: the gateway has seen revision 31",
-        "The gateway's witness shows a restore: see zoeymcp health, then zoeymcp policy "
-        "acknowledge-restore (revision 32).",
+        "The gateway's witness shows a restore (revision 32): see "
+        f"{HOST} zoeymcp health, then run: {HOST} zoeymcp policy acknowledge-restore",
     ]
     jump = (
         "Revision 1 jumps to 32: one above the gateway's claim of 31; the number comes from the "

@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Final, TextIO
 from urllib.parse import quote
 
@@ -64,6 +65,8 @@ DEFAULT_COMPOSE_CMD: Final = "docker compose -f deploy/compose.hardened.yaml"
 STANDARD_COMPOSE_CMD: Final = "docker compose -f deploy/compose.yaml"
 # The standard tier's one service, which runs both roles.
 STANDARD_SERVICE: Final = "zoeymcp"
+# The shipped hardened file's vault service, when the container's environment names none (M.7).
+DEFAULT_EXEC_SERVICE: Final = "vault"
 # The command line this process was started with, after ``zoeymcp``: the way out of an
 # unreachable socket repeats it (:func:`way_out`). ``main`` sets it.
 INVOKED: list[str] = []
@@ -117,6 +120,84 @@ def way_out(role: str, environ: Mapping[str, str] | None = None) -> str:
             f"{compose} logs {shlex.quote(here)} says which"
         )
     return f"run it in the {role}'s container: {compose} exec {role} {command}"
+
+
+@dataclass(frozen=True)
+class Prefix:
+    """How a command ZoeyMCP prints is run from the host (M7 design M.7): the compose command
+    and the service. Every command a way out names goes through :meth:`line`, the ``Next:``
+    blocks' and the one-line hints' alike (M8 UX pass, D4)."""
+
+    compose: str = DEFAULT_COMPOSE_CMD
+    service: str = DEFAULT_EXEC_SERVICE
+
+    @classmethod
+    def from_environ(cls, environ: Mapping[str, str] | None = None) -> Prefix:
+        """This container's own service, as the compose file names it."""
+        environ = os.environ if environ is None else environ
+        return cls(
+            environ.get(COMPOSE_CMD_ENV) or DEFAULT_COMPOSE_CMD,
+            environ.get(EXEC_SERVICE_ENV) or DEFAULT_EXEC_SERVICE,
+        )
+
+    @classmethod
+    def for_role(cls, role: str, environ: Mapping[str, str] | None = None) -> Prefix:
+        """``role``'s container: this one when it is that role's, or the standard tier's, which
+        runs both roles; else the hardened file's service of that name."""
+        environ = os.environ if environ is None else environ
+        here = environ.get(EXEC_SERVICE_ENV)
+        service = here if here in (role, STANDARD_SERVICE) else role
+        return cls(environ.get(COMPOSE_CMD_ENV) or DEFAULT_COMPOSE_CMD, service)
+
+    def line(self, command: str, via: str | None, *, piped: bool = False) -> str:
+        """``command`` (already shell-quoted) as typed on the host, by its ``via``: in the
+        running service (``-T`` when stdin or stdout is piped), a one-off container (with the
+        working directory at /w), the service recreated, restarted or sent ``SIGHUP``; with no
+        ``via``, as it is."""
+        service = shlex.quote(self.service)
+        tty = " -T" if piped else ""
+        if via == "exec":
+            return f"{self.compose} exec{tty} {service} {command}"
+        if via == "run":
+            return f"{self.compose} run --rm --no-deps{tty} {service} {command}"
+        if via == "run_mount":
+            return f'{self.compose} run --rm --no-deps{tty} -v "$PWD:/w:ro" {service} {command}'
+        if via == "up":
+            return f"{self.compose} up -d {service}"
+        if via == "restart":
+            return f"{self.compose} restart {service}"
+        if via == "hup":
+            return f"{self.compose} kill -s HUP {service}"
+        return command
+
+    def zoeymcp(self, *words: str, piped: bool = False) -> str:
+        """``zoeymcp WORDS`` (each word shell-quoted) run in this service."""
+        return self.line(shlex.join(["zoeymcp", *words]), "exec", piped=piped)
+
+
+def on_host(*words: str, role: str = "vault", piped: bool = False) -> str:
+    """``zoeymcp WORDS``, a way out, as typed on the host to run it in ``role``'s container."""
+    return Prefix.for_role(role).zoeymcp(*words, piped=piped)
+
+
+def confirmed(question: str, *, yes: bool, stdin: TextIO, err: TextIO, nothing: str) -> bool:
+    """``[y/N]`` at a terminal, unless ``--yes``: a destructive command asks, as a policy write
+    does (D9). Off a terminal there is no answer to read, so without ``--yes`` it does nothing
+    and names ``--yes``; ``nothing`` says what wasn't done ("Nothing removed")."""
+    if yes:
+        return True
+    if not stdin.isatty():
+        err.write(
+            f"{nothing}: standard input isn't a terminal, so there is no answer to read. "
+            "Run this again with --yes.\n"
+        )
+        return False
+    err.write(f"{question} [y/N] ")
+    err.flush()
+    if stdin.readline().strip().lower() in ("y", "yes"):
+        return True
+    err.write(f"{nothing}.\n")
+    return False
 
 
 def socket_path(explicit: str | None) -> str:

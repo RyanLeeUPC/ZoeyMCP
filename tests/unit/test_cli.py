@@ -87,6 +87,17 @@ from .test_onboarding import staged as onboarding_staged
 from .test_policy_change import notes_change, review_change
 from .test_review import policy as review_server
 
+# The vault's container as a way out names it, with no compose variables (D4).
+HOST = "docker compose -f deploy/compose.hardened.yaml exec vault"
+
+
+@pytest.fixture(autouse=True)
+def no_compose_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every way out is printed for the host; these tests read the hardened file's, unless one
+    sets the compose variables itself."""
+    for name in (admin_client.COMPOSE_CMD_ENV, admin_client.EXEC_SERVICE_ENV):
+        monkeypatch.delenv(name, raising=False)
+
 
 def run(argv: list[str], stdin: str = "") -> tuple[int, str]:
     out = io.StringIO()
@@ -309,6 +320,7 @@ def test_a_squid_src_naming_no_source_is_a_usage_error() -> None:
         ["--allowlist-format", "squid"],
         ["--squid-src", "vault=net"],
         ["--check", "zoeymcp.conf"],
+        ["--compare", "zoeymcp.conf"],
     ],
 )
 def test_emitter_flags_without_emit_are_a_usage_error(flags: list[str]) -> None:
@@ -316,7 +328,7 @@ def test_emitter_flags_without_emit_are_a_usage_error(flags: list[str]) -> None:
     assert code == EXIT_UNREADABLE
     assert out == ""
     assert err == (
-        "zoeymcp check: --allowlist-format, --squid-src and --check go with "
+        "zoeymcp check: --allowlist-format, --squid-src and --compare go with "
         "--emit-egress-allowlist\n"
     )
 
@@ -878,7 +890,8 @@ HEADER = (
 STORED = (
     "Stored the refresh token for music as oauth.music.live.\n"
     "Granted: read admin\n"
-    "The grant ends at 2027-04-15T09:00:00Z; run login again before then.\n"
+    f"The grant ends at 2027-04-15T09:00:00Z; connect again before then: {HOST} zoeymcp login "
+    "music\n"
     "The env seed MUSIC_REFRESH is now ignored (reseed: never). You may remove it.\n"
 )
 
@@ -1001,7 +1014,7 @@ def test_login_start_prints_the_url_and_the_flow(admin: FakeAdmin) -> None:
     code, out, err = cli(["login", "music", "--start", "--rebind", "--socket", "x"])
     assert code == EXIT_OK
     assert out == HEADER + (
-        "\nThen, within 10 minutes, run: zoeymcp login music --flow=flow-0001\n"
+        f"\nThen, within 10 minutes, run: {HOST} zoeymcp login music --flow=flow-0001\n"
         "and give it the address your browser was sent to.\n"
     )
     assert err == ""
@@ -1026,7 +1039,7 @@ def test_a_flow_id_may_start_with_a_dash(admin: FakeAdmin) -> None:
     admin.answers[("POST", "/oauth/music/login")] = (200, {**STARTED, "flow": "-flow-0001"})
     code, out, _ = cli(["login", "music", "--start", "--socket", "x"])
     assert code == EXIT_OK
-    [printed] = re.findall(r"run: zoeymcp (login .*)$", out, re.MULTILINE)
+    [printed] = re.findall(r"run: .* zoeymcp (login .*)$", out, re.MULTILINE)
     code, out, _ = cli([*shlex.split(printed), "--socket", "x"], io.StringIO(PASTED))
     assert (code, out) == (EXIT_OK, STORED)
     assert admin.requests[-1] == (
@@ -1140,7 +1153,8 @@ def test_a_login_kept_only_in_memory_exits_1(admin: FakeAdmin) -> None:
     assert out == (
         "Stored the refresh token for music as oauth.music.live.\n"
         "Granted: read admin\n"
-        "The refresh token expires at 2026-10-18T09:00:00Z; run login again before then.\n"
+        "The refresh token expires at 2026-10-18T09:00:00Z; connect again before then: "
+        f"{HOST} zoeymcp login music\n"
     )
     assert err == f"missing: write delete\nzoeymcp login: {NOT_PERSISTED}\n"
     assert NOT_PERSISTED == (
@@ -1572,19 +1586,19 @@ def health_report(**changes: Any) -> dict[str, Any]:
 HEALTH_LINES = [
     "notes (header): info",
     "  info    binding_wider: store:notes-key is bound to more than the policy uses; it works",
-    "          run: zoeymcp secret set notes-key",
+    f"          run: {HOST} zoeymcp secret set notes-key",
     "music (oauth2): error",
     "  error   missing: store:music-refresh has no entry",
-    "          run: zoeymcp login music",
+    f"          run: {HOST} zoeymcp login music",
     "  warning last_failure: last attempt failed: oauth_unavailable at 2026-10-16T09:00:00Z "
     "(from stored metadata)",
-    "          run: zoeymcp oauth reset music",
+    f"          run: {HOST} zoeymcp oauth reset music",
     "connector mail: warning (17 of 20 sends in 24 h)",
     "  warning near_limit: 17 of 20 sends in the last 24 hours",
     "          wait: it clears with time",
     "store: info (5 entries)",
     "  info    unreferenced: nothing in the policy uses store:old-key",
-    "          run: zoeymcp secret delete old-key",
+    f"          run: {HOST} zoeymcp secret delete old-key",
     "health: FAILED (1 error, 2 warnings, 2 info)",
 ]
 
@@ -1646,17 +1660,18 @@ def test_health_with_no_vault_at_all(tmp_path: Path) -> None:
     ("action", "text"),
     [
         (None, None),
-        ({"kind": "connect", "credential": "music"}, "run: zoeymcp login music"),
-        ({"kind": "reset", "credential": "music"}, "run: zoeymcp oauth reset music"),
+        ({"kind": "connect", "credential": "music"}, f"run: {HOST} zoeymcp login music"),
+        ({"kind": "reset", "credential": "music"}, f"run: {HOST} zoeymcp oauth reset music"),
         (
             {"kind": "set_secret", "credential": "music", "ref": "store:music-id"},
-            "run: zoeymcp secret set music-id",
+            f"run: {HOST} zoeymcp secret set music-id",
         ),
         (
             {"kind": "restart", "connector": "mail", "ref": "env:MAIL_USER"},
-            "set env MAIL_USER and restart the vault",
+            "set MAIL_USER in the vault's environment, then recreate it: "
+            "docker compose -f deploy/compose.hardened.yaml up -d vault",
         ),
-        ({"kind": "delete_secret", "secret": "old"}, "run: zoeymcp secret delete old"),
+        ({"kind": "delete_secret", "secret": "old"}, f"run: {HOST} zoeymcp secret delete old"),
         ({"kind": "fix_policy", "credential": "music"}, "fix the policy"),
         ({"kind": "wait", "connector": "mail"}, "wait: it clears with time"),
         ({"kind": "check_volume"}, "check the state volume"),
@@ -1666,21 +1681,21 @@ def test_health_with_no_vault_at_all(tmp_path: Path) -> None:
         ),
         (
             {"kind": "add_passkey"},
-            "run: zoeymcp setup-code, and enrol a second passkey with it",
+            f"run: {HOST} zoeymcp setup-code, and enrol a second passkey with it",
         ),
         (
             {"kind": "review_passkeys"},
-            "run: zoeymcp passkeys, and remove any you don't recognize",
+            f"run: {HOST} zoeymcp passkeys list, and remove any you don't recognize",
         ),
-        ({"kind": "reset_passkeys"}, "run: zoeymcp setup-code --reset"),
-        ({"kind": "list_approvals"}, "run: zoeymcp approvals list"),
+        ({"kind": "reset_passkeys"}, f"run: {HOST} zoeymcp setup-code --reset"),
+        ({"kind": "list_approvals"}, f"run: {HOST} zoeymcp approvals list"),
         (
             {
                 "kind": "onboard_again",
                 "credential": "notes",
-                "command": "zoeymcp login --mcp https://mcp.notes.example/mcp --reregister",
+                "command": "zoeymcp onboard https://mcp.notes.example/mcp --reregister",
             },
-            "run: zoeymcp login --mcp https://mcp.notes.example/mcp --reregister",
+            f"run: {HOST} zoeymcp onboard https://mcp.notes.example/mcp --reregister",
         ),
         (
             {
@@ -1690,7 +1705,7 @@ def test_health_with_no_vault_at_all(tmp_path: Path) -> None:
                 "fragment": "# zoeymcp: widen the scope of notes\n",
             },
             'merge credentials.notes.scope: "notes.read notes.write" (the fragment is in health '
-            "--json), check and reload the policy, then run: zoeymcp login notes",
+            f"--json), check and reload the policy, then run: {HOST} zoeymcp login notes",
         ),
         # A newer vault's action: its kind.
         ({"kind": "enrol_elsewhere"}, "enrol_elsewhere"),
@@ -1944,7 +1959,7 @@ PAGE_LINES = [
     "orphan send a1b5000000000000.1 on mail: sent at 2026-10-19T05:01:00Z (a_later_flag)",
     f"archived archive-1767276000000: seq 0-9 (head {HEAD}), last received "
     "2026-01-01 14:00:00Z, 5450 bytes",
-    "older rows: zoeymcp ledger --vault --before 11",
+    f"older rows: {HOST} zoeymcp ledger vault --before 11",
     "each row is as reported by the gateway",
 ]
 
@@ -1981,7 +1996,7 @@ def test_ledger_vault_says_what_is_wrong(admin: FakeAdmin) -> None:
         "copy: fork, nothing reported yet",
         "broken: the copy's files stop chaining at seq 4",
         "refused: fork at seq 3 (held seq 9, 2026-01-01 14:00:00Z); after deciding why, run: "
-        "zoeymcp ledger --vault --restart-chain",
+        f"{HOST} zoeymcp ledger vault --restart-chain",
         f"archived archive-1767276000000: seq 0-9 (head {HEAD}), last received "
         "2026-01-01 14:00:00Z, 5450 bytes, files dropped",
     ]
@@ -2221,7 +2236,7 @@ def test_health_shows_the_ledger_copy(admin: FakeAdmin) -> None:
     assert out.splitlines()[1:4] == [
         "ledger copy: error (fork, head seq 9)",
         "  error   ledger_copy_refused: a fork",
-        "          run: zoeymcp ledger --vault",
+        f"          run: {HOST} zoeymcp ledger vault",
     ]
     assert health_action({"kind": "check_gateway"}) == (
         "check that the gateway runs and reaches the vault"
@@ -2294,7 +2309,7 @@ def test_health_shows_what_the_gateway_reports(admin: FakeAdmin) -> None:
     assert out.splitlines()[1:4] == [
         "gateway: warning (the gateway reported 42 s ago)",
         "  warning tools_unreviewed: notes lists 1 tool nobody reviewed",
-        "          run: zoeymcp review notes",
+        f"          run: {HOST} zoeymcp review notes",
     ]
     assert cli(["health", "--socket", "x", "--strict"])[0] == EXIT_FINDINGS
     report["gateway"] = {**section, "reported_ago": None, "level": "ok", "findings": []}
@@ -2346,7 +2361,7 @@ def test_health_shows_the_egress_section_only_with_findings(admin: FakeAdmin) ->
                 "passkeys: info (1 enrolled)",
                 "  info    passkey_single: only one passkey is enrolled: add a second, so losing "
                 "one doesn't lock you out",
-                "          run: zoeymcp setup-code, and enrol a second passkey with it",
+                f"          run: {HOST} zoeymcp setup-code, and enrol a second passkey with it",
             ],
         ),
         (
@@ -2355,7 +2370,7 @@ def test_health_shows_the_egress_section_only_with_findings(admin: FakeAdmin) ->
                 "passkeys: warning (2 enrolled)",
                 "  warning passkey_counter: a passkey's signature counter went back in the last "
                 "30 days: the authenticator may have been copied",
-                "          run: zoeymcp passkeys, and remove any you don't recognize",
+                f"          run: {HOST} zoeymcp passkeys list, and remove any you don't recognize",
             ],
         ),
         (
@@ -2364,7 +2379,7 @@ def test_health_shows_the_egress_section_only_with_findings(admin: FakeAdmin) ->
                 "passkeys: error (can't be verified)",
                 "  error   passkeys_unavailable: the passkey file can't be verified (edited, or "
                 "written under another master key); portal login is off",
-                "          run: zoeymcp setup-code --reset",
+                f"          run: {HOST} zoeymcp setup-code --reset",
             ],
         ),
         ({"count": 3}, ["passkeys: ok (3 enrolled)"]),
@@ -2404,9 +2419,19 @@ FIRST_LINE = (
     "https://zoeymcp.tailnet.example, choose I have a setup code, and type the code.\n"
 )
 REFUSED_LINE = (
-    "If the portal refuses this code before you have used it, someone else has: run zoeymcp "
-    "setup-code --reset.\n"
+    "If the portal refuses this code before you have used it, someone else has; run: "
+    f"{HOST} zoeymcp setup-code --reset\n"
 )
+
+
+def refused_offline(state: Path) -> str:
+    """The same line offline, where the command runs again as it was typed (D4)."""
+    return (
+        "If the portal refuses this code before you have used it, someone else has; run: "
+        f"zoeymcp setup-code --reset --state {shlex.quote(str(state))}\n"
+    )
+
+
 TEST_MASTER = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"  # bytes(range(32))
 
 
@@ -2441,8 +2466,8 @@ def test_setup_code_prints_the_code_and_where_to_use_it(admin: FakeAdmin) -> Non
         ({"passkeys": 0, "reset": True}, ""),
         (
             {"passkeys": None},
-            "The passkey file can't be verified: only a code issued with --reset can enrol; run "
-            "zoeymcp setup-code --reset.\n",
+            "The passkey file can't be verified: only a code issued with --reset can enrol; run: "
+            f"{HOST} zoeymcp setup-code --reset\n",
         ),
         (
             {"passkeys": None, "reset": True},
@@ -2604,7 +2629,7 @@ def test_setup_code_offline_writes_a_record_the_vault_redeems(
     assert err == (
         "One-time code, valid for 15 minutes. Open the portal, choose I have a setup code, and "
         "type the code.\n"
-    ) + (REFUSED_LINE)
+    ) + refused_offline(tmp_path)
     typed = out.strip()
     key = KeySet.from_text(TEST_MASTER).portal_key
     record = setupcode.unseal((tmp_path / "setup.json").read_bytes(), key)
@@ -2730,11 +2755,15 @@ def test_passkeys_are_listed(admin: FakeAdmin) -> None:
     admin.answers[("GET", "/passkeys")] = (200, {"passkeys": LISTED})
     text = "".join(f"{line}\n" for line in LISTED_LINES)
     assert cli(["passkeys", "--socket", "x"]) == (EXIT_OK, text, "")
+    # D14: list is the default action, and --socket goes before or after it.
+    assert cli(["passkeys", "list", "--socket", "x"]) == (EXIT_OK, text, "")
+    assert cli(["passkeys", "--socket", "x", "list"]) == (EXIT_OK, text, "")
     admin.answers[("GET", "/passkeys")] = (200, {"passkeys": []})
     assert cli(["passkeys", "--socket", "x"]) == (
         EXIT_OK,
         "",
-        "No passkeys: the portal waits for a setup code. Issue one with: zoeymcp setup-code\n",
+        f"No passkeys: the portal waits for a setup code. Issue one with: {HOST} zoeymcp "
+        "setup-code\n",
     )
     unavailable = {"error": "the passkey file can't be verified", "reason": "unavailable"}
     admin.answers[("GET", "/passkeys")] = (503, unavailable)
@@ -2746,29 +2775,110 @@ def test_passkeys_are_listed(admin: FakeAdmin) -> None:
 
 
 def test_a_passkey_is_removed(admin: FakeAdmin) -> None:
+    """``passkeys remove FINGERPRINT --yes``, and the flag form before the actions (D14), which
+    takes --yes too: neither asks, nor lists first."""
     path = "/passkeys/3f9a1c0e52d4b7a8"
     removed = {"removed": LISTED[0], "sessions_ended": 2, "remaining": 1}
     admin.answers[("DELETE", path)] = (200, removed)
-    assert cli(["passkeys", "--remove", "3f9a1c0e52d4b7a8", "--socket", "x"]) == (
-        EXIT_OK,
-        f"Removed {LISTED_LINES[0]}\n{LISTED_LINES[1]}\n2 sessions ended; 1 passkey left.\n",
-        "",
-    )
+    said = f"Removed {LISTED_LINES[0]}\n{LISTED_LINES[1]}\n2 sessions ended; 1 passkey left.\n"
+    for argv in (
+        ["passkeys", "remove", "3f9a1c0e52d4b7a8", "--yes", "--socket", "x"],
+        ["passkeys", "--remove", "3f9a1c0e52d4b7a8", "--yes", "--socket", "x"],
+        ["passkeys", "--socket", "x", "remove", "3f9a1c0e52d4b7a8", "--yes"],
+    ):
+        assert cli(argv) == (EXIT_OK, said, "")
+    assert admin.requests == [("DELETE", path, None)] * 3
     admin.answers[("DELETE", path)] = (200, {**removed, "remaining": 0, "sessions_ended": 1})
-    code, out, err = cli(["passkeys", "--remove", "3f9a1c0e52d4b7a8", "--socket", "x"])
+    code, out, err = cli(["passkeys", "remove", "3f9a1c0e52d4b7a8", "--yes", "--socket", "x"])
     assert (code, out.splitlines()[-1]) == (EXIT_OK, "1 session ended; 0 passkeys left.")
-    assert err == "No passkey is left: the portal waits for a setup code (zoeymcp setup-code).\n"
+    assert err == (
+        "No passkey is left: the portal waits for a setup code. Issue one with: "
+        f"{HOST} zoeymcp setup-code\n"
+    )
     admin.answers[("DELETE", "/passkeys/0000000000000000")] = (
         404,
         {"error": "no passkey has that fingerprint", "reason": "not_found"},
     )
-    assert cli(["passkeys", "--remove", "0000000000000000", "--socket", "x"]) == (
+    assert cli(["passkeys", "remove", "0000000000000000", "--yes", "--socket", "x"]) == (
         EXIT_FINDINGS,
         "",
         "zoeymcp passkeys: no passkey has that fingerprint\n",
     )
     admin.answers[("DELETE", "/passkeys/a%2Fb")] = (400, {"error": "bad", "reason": "x"})
-    assert cli(["passkeys", "--remove", "a/b", "--socket", "x"])[0] == EXIT_FINDINGS
+    assert cli(["passkeys", "remove", "a/b", "--yes", "--socket", "x"])[0] == EXIT_FINDINGS
+
+
+class Typed(io.StringIO):
+    """A terminal the operator types ``text`` at: confirmations read it (D9)."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_removing_a_passkey_asks_at_a_terminal(admin: FakeAdmin) -> None:
+    """D9: at a terminal, ``passkeys remove`` shows the passkey and asks; anything but yes
+    removes nothing and exits 1."""
+    path = "/passkeys/3f9a1c0e52d4b7a8"
+    admin.answers[("GET", "/passkeys")] = (200, {"passkeys": LISTED})
+    admin.answers[("DELETE", path)] = (
+        200,
+        {"removed": LISTED[0], "sessions_ended": 0, "remaining": 1},
+    )
+    shown = f"{LISTED_LINES[0]}\n{LISTED_LINES[1]}\n"
+    argv = ["passkeys", "remove", "3f9a1c0e52d4b7a8", "--socket", "x"]
+    code, out, err = cli(argv, Typed("n\n"))
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert err == shown + "Remove it and end its sessions? [y/N] Nothing removed.\n"
+    assert admin.requests == [("GET", "/passkeys", None)]
+    code, out, err = cli(argv, Typed("y\n"))
+    assert (code, out.startswith("Removed 3f9a1c0e52d4b7a8")) == (EXIT_OK, True)
+    assert err == shown + "Remove it and end its sessions? [y/N] "
+    assert admin.requests[-1] == ("DELETE", path, None)
+    # The old flag form asks too.
+    assert (
+        cli(["passkeys", "--remove", "3f9a1c0e52d4b7a8", "--socket", "x"], Typed("yes\n"))[0] == 0
+    )
+
+
+def test_removing_the_last_passkey_says_the_portal_then_waits(admin: FakeAdmin) -> None:
+    """D9: the last passkey's question follows the line that says what it leaves."""
+    admin.answers[("GET", "/passkeys")] = (200, {"passkeys": LISTED[:1]})
+    code, _, err = cli(["passkeys", "remove", "3f9a1c0e52d4b7a8", "--socket", "x"], Typed("\n"))
+    assert code == EXIT_FINDINGS
+    assert err.endswith(
+        "This is the last passkey: with none left, the portal waits for a setup code.\n"
+        "Remove it and end its sessions? [y/N] Nothing removed.\n"
+    )
+    assert main_module.LAST_PASSKEY in err
+    # Two listed: no such line.
+    admin.answers[("GET", "/passkeys")] = (200, {"passkeys": LISTED})
+    assert (
+        main_module.LAST_PASSKEY
+        not in cli(["passkeys", "remove", "3f9a1c0e52d4b7a8", "--socket", "x"], Typed("\n"))[2]
+    )
+
+
+def test_removing_a_passkey_off_a_terminal_needs_yes(admin: FakeAdmin) -> None:
+    """D9: off a terminal there is no answer to read, so without --yes nothing is removed, and
+    the refusal names --yes, as a policy write's does (exit 1)."""
+    admin.answers[("GET", "/passkeys")] = (200, {"passkeys": LISTED})
+    code, out, err = cli(["passkeys", "remove", "3f9a1c0e52d4b7a8", "--socket", "x"])
+    assert (code, out) == (EXIT_FINDINGS, "")
+    assert err.endswith(
+        "Nothing removed: standard input isn't a terminal, so there is no answer to read. "
+        "Run this again with --yes.\n"
+    )
+    assert [method for method, _, _ in admin.requests] == ["GET"]
+    # A fingerprint the vault doesn't list isn't asked about: the vault says why not.
+    admin.answers[("DELETE", "/passkeys/0000000000000000")] = (
+        404,
+        {"error": "no passkey has that fingerprint", "reason": "not_found"},
+    )
+    assert cli(["passkeys", "remove", "0000000000000000", "--socket", "x"]) == (
+        EXIT_FINDINGS,
+        "",
+        "zoeymcp passkeys: no passkey has that fingerprint\n",
+    )
 
 
 SESSIONS = [
@@ -2807,22 +2917,60 @@ def test_sessions_are_listed_and_ended(admin: FakeAdmin) -> None:
         json.dumps({"sessions": SESSIONS}, indent=2, sort_keys=True) + "\n",
         "",
     )
+    # D14: list is the default action; --format and --socket go before or after it.
+    assert cli(["sessions", "list", "--socket", "x"])[1] == cli(["sessions", "--socket", "x"])[1]
+    assert cli(["sessions", "--format", "json", "--socket", "x", "list"])[1].startswith("{")
     admin.answers[("DELETE", "/sessions")] = (200, {"ended": 3})
-    assert cli(["sessions", "--end-all", "--socket", "x"]) == (
+    assert cli(["sessions", "end", "--yes", "--socket", "x"]) == (
         EXIT_OK,
         "Ended 3 portal sessions.\n",
         "",
     )
     admin.answers[("DELETE", "/sessions")] = (200, {"ended": 1})
-    assert cli(["sessions", "--end-all", "--socket", "x"])[1] == "Ended 1 portal session.\n"
-    assert cli(["sessions", "--end-all", "--format", "json", "--socket", "x"])[1] == (
+    # The flag form before the actions, with --yes.
+    assert cli(["sessions", "--end-all", "--yes", "--socket", "x"])[1] == (
+        "Ended 1 portal session.\n"
+    )
+    assert cli(["sessions", "end", "--yes", "--format", "json", "--socket", "x"])[1] == (
         '{\n  "ended": 1\n}\n'
     )
     admin.answers[("DELETE", "/sessions")] = (503, {"error": "stopping"})
-    assert cli(["sessions", "--end-all", "--socket", "x"]) == (
+    assert cli(["sessions", "end", "--yes", "--socket", "x"]) == (
         EXIT_UNREADABLE,
         "",
         "zoeymcp sessions: stopping\n",
+    )
+
+
+def test_ending_the_sessions_asks_at_a_terminal(admin: FakeAdmin) -> None:
+    """D9: ``sessions end`` (and ``--end-all``) says how many it ends, yours included, and asks
+    at a terminal; off one, nothing is ended without --yes; with none to end, it doesn't ask."""
+    admin.answers[("GET", "/sessions")] = (200, {"sessions": SESSIONS})
+    admin.answers[("DELETE", "/sessions")] = (200, {"ended": 2})
+    question = "End 2 portal sessions, including any you are signed in with? [y/N] "
+    assert cli(["sessions", "end", "--socket", "x"], Typed("n\n")) == (
+        EXIT_FINDINGS,
+        "",
+        question + "Nothing ended.\n",
+    )
+    assert cli(["sessions", "--end-all", "--socket", "x"], Typed("y\n")) == (
+        EXIT_OK,
+        "Ended 2 portal sessions.\n",
+        question,
+    )
+    assert cli(["sessions", "end", "--socket", "x"]) == (
+        EXIT_FINDINGS,
+        "",
+        "Nothing ended: standard input isn't a terminal, so there is no answer to read. Run "
+        "this again with --yes.\n",
+    )
+    assert [method for method, _, _ in admin.requests].count("DELETE") == 1
+    admin.answers[("GET", "/sessions")] = (200, {"sessions": []})
+    admin.answers[("DELETE", "/sessions")] = (200, {"ended": 0})
+    assert cli(["sessions", "end", "--socket", "x"]) == (
+        EXIT_OK,
+        "Ended 0 portal sessions.\n",
+        "",
     )
 
 
@@ -2935,8 +3083,8 @@ def test_login_mcp_writes_fragment_1_to_stdout_and_the_rest_to_stderr(
         f"    {HARDENED} run --rm --no-deps vault check\n"
         "  Commit, then recreate the vault:\n"
         f"    {HARDENED} up -d vault\n"
-        "  Then sign in and review:\n"
-        f"    {HARDENED} exec vault zoeymcp login --mcp 'https://mcp.notes.example/a;id' "
+        "  Then connect and review:\n"
+        f"    {HARDENED} exec vault zoeymcp onboard 'https://mcp.notes.example/a;id' "
         "--name notes\n"
     )
 
@@ -2951,7 +3099,7 @@ def test_the_prefix_comes_from_the_compose_variables(
     code, _, err = cli([*PUBLIC_ARGV, "--yes"])
     assert code == EXIT_OK
     assert "    docker compose -f deploy/compose.yaml -p mine up -d zoeymcp\n" in err
-    assert "docker compose -f deploy/compose.yaml -p mine exec zoeymcp zoeymcp login" in err
+    assert "docker compose -f deploy/compose.yaml -p mine exec zoeymcp zoeymcp onboard" in err
 
 
 def test_each_way_a_command_runs() -> None:
@@ -3136,8 +3284,8 @@ def test_a_client_secret_is_never_an_argument(admin: FakeAdmin, written: list[st
             "--squid-src vault=bad-acl: write vault=ACL, ACL 1 to 64 letters, digits or "
             "underscores",
         ),
-        (["music", "--plan-only"], "--plan-only goes with --mcp"),
-        (["music", "--name", "n", "--yes"], "--name, --yes go with --mcp"),
+        (["music", "--plan-only"], "--plan-only goes with zoeymcp onboard URL"),
+        (["music", "--name", "n", "--yes"], "--name, --yes go with zoeymcp onboard URL"),
     ],
 )
 def test_login_mcp_usage_errors(admin: FakeAdmin, argv: list[str], message: str) -> None:
@@ -3278,7 +3426,7 @@ def test_the_retry_on_a_terminal_has_no_redirect(
                 "  differs: credentials.notes.token_url",
                 "Next:",
                 "  Register a new client:",
-                f"    {HARDENED} exec vault zoeymcp login --mcp {URL} --reregister",
+                f"    {HARDENED} exec vault zoeymcp onboard {URL} --reregister",
             ],
         ),
     ],
@@ -3353,7 +3501,7 @@ def test_a_registration_from_the_cli(onboard_admin: FakeAdmin) -> None:
     code, _, err = cli(["login", "music", "--callback-origin", origin, "--socket", "x"])
     assert (code, err) == (
         onboard_cli.EXIT_USAGE,
-        "zoeymcp login: --callback-origin goes with --mcp\n",
+        "zoeymcp login: --callback-origin goes with zoeymcp onboard URL\n",
     )
 
 
@@ -3674,7 +3822,7 @@ def test_j1_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
     # Signed in, the run again compares and doesn't sign in over the token it holds (OPS-13).
     code, out, err, browser = onboarded(vault, J1)
     assert (code, out, browser.visits) == (EXIT_OK, "", 0)
-    assert "notes already holds a refresh token (stored), so this run doesn't sign in again" in err
+    assert "notes already holds a refresh token (stored), so this run doesn't connect again" in err
 
 
 def test_j3_through_the_cli_up_to_a_completed_login(vault: Vault) -> None:
@@ -3756,7 +3904,7 @@ def test_a_reregistration_signs_in_over_a_moved_token_endpoint(
     assert code == EXIT_OK, err
     assert "# changed: notes (token_url)" in fragment.splitlines()
     assert err.endswith(
-        f"  Then sign in with the new client:\n    {HARDENED} exec vault zoeymcp login notes "
+        f"  Then connect with the new client:\n    {HARDENED} exec vault zoeymcp login notes "
         "--rebind\n"
     )
     vault.commit(fragment)
@@ -3784,11 +3932,11 @@ def test_the_second_run_names_each_field_that_differs(vault: Vault) -> None:
     assert err.splitlines() == [
         "zoeymcp login: The committed policy differs from what the server publishes now, at "
         "credentials.notes.token_url. Revert the edit, or register a new client with zoeymcp "
-        "login --mcp URL --reregister.",
+        "onboard URL --reregister.",
         "  differs: credentials.notes.token_url",
         "Next:",
         "  Register a new client:",
-        f"    {HARDENED} exec vault zoeymcp login --mcp {onboard_model.SERVER_URL} --reregister",
+        f"    {HARDENED} exec vault zoeymcp onboard {onboard_model.SERVER_URL} --reregister",
     ]
 
 
@@ -3827,7 +3975,7 @@ def test_adopting_a_grant_with_no_connect(vault: Vault) -> None:
     vault.commit(fragment)
     code, out, err, browser = onboarded(vault, [*J1, "--no-connect"])
     assert (code, out, browser.visits) == (EXIT_OK, "", 0)
-    assert "Not signing in (--no-connect).\nNext:\n  Sign in:\n" in err
+    assert "Not connecting (--no-connect).\nNext:\n  Connect:\n" in err
     assert f"    {HARDENED} exec vault zoeymcp login notes\n" in err
     seeded = cli(["secret", "set", "notes-refresh", "--socket", "x"], io.StringIO("rt-adopted-1"))
     assert seeded[0] == EXIT_OK, seeded
@@ -4535,10 +4683,11 @@ def managed_example() -> str:
 def test_check_of_a_managed_document_says_it_isnt_the_running_revision(tmp_path: Path) -> None:
     """``check`` (with ``--with`` and ``--emit-egress-allowlist`` too) and ``selftest`` read the
     document they are given, never the head: of a managed one they say so on stderr (M.6)."""
-    said = f"zoeymcp check: {main_module.NOT_THE_HEAD}\n"
-    assert main_module.NOT_THE_HEAD == (
-        "checking this document, not the running revision: to check what runs, pipe zoeymcp "
-        "policy export into this command with --config -"
+    # D4: the way on as typed on the host, the vault's export piped into a one-off container.
+    said = (
+        "zoeymcp check: checking this document, not the running revision: to check what runs, "
+        f"pipe the export into it: {HARDENED} exec -T vault zoeymcp policy export | {HARDENED} "
+        "run --rm --no-deps -T vault check --config -\n"
     )
     code, out, err = cli(["check", "--config", "-"], io.StringIO(managed_example()))
     assert (code, err) == (EXIT_OK, said)
@@ -4560,7 +4709,11 @@ def test_check_of_a_managed_document_says_it_isnt_the_running_revision(tmp_path:
     )
     # The selftest's own errors go to stderr too (D18), after the note.
     said, _, rest = err.partition("\n")
-    assert said == f"zoeymcp selftest: {main_module.NOT_THE_HEAD}"
+    assert said == (
+        "zoeymcp selftest: checking this document, not the running revision: to check what runs, "
+        f"pipe the export into it: {HARDENED} exec -T vault zoeymcp policy export | {HARDENED} "
+        f"run --rm --no-deps -T vault selftest --config - --cases {shlex.quote(cases)}"
+    )
     assert (code, out, rest.startswith(f"zoeymcp selftest: can't use {cases}: ")) == (2, "", True)
     code, out, err = cli(["selftest", "--config", str(EXAMPLE_POLICY), "--cases", cases])
     assert (code, out, err.startswith(f"zoeymcp selftest: can't use {cases}: ")) == (2, "", True)
@@ -4934,12 +5087,13 @@ def test_the_help_shows_value_less_flags_bare() -> None:
     """D15: ``--client-secret`` parses a value only to refuse it, and shows none; ``approver``
     names its kind."""
     parser = main_module._build_parser()
-    login = parser.parse_args(["login", "--mcp", URL]).client_secret
-    given = parser.parse_args(["login", "--mcp", URL, "--client-secret"]).client_secret
-    valued = parser.parse_args(["login", "--mcp", URL, "--client-secret=x"]).client_secret
-    assert (login, given, valued) == (False, True, "x")
+    for argv in (["login", "--mcp", URL], ["onboard", URL]):
+        login = parser.parse_args(argv).client_secret
+        given = parser.parse_args([*argv, "--client-secret"]).client_secret
+        valued = parser.parse_args([*argv, "--client-secret=x"]).client_secret
+        assert (login, given, valued) == (False, True, "x")
     with contextlib.redirect_stdout(io.StringIO()) as shown, pytest.raises(SystemExit):
-        parser.parse_args(["login", "--help"])
+        parser.parse_args(["onboard", "--help"])
     text = shown.getvalue()
     assert "[--client-secret]" in text
     assert "--client-secret " not in text.split("\n\n")[0]  # the usage
@@ -4981,17 +5135,68 @@ def test_secret_lines_are_sentences(admin: FakeAdmin) -> None:
         "",
     )
     admin.answers[("DELETE", "/secrets/notes-key")] = (200, {})
-    assert cli(["secret", "delete", "notes-key", "--socket", "x"]) == (
+    assert cli(["secret", "delete", "notes-key", "--yes", "--socket", "x"]) == (
         EXIT_OK,
         "Deleted notes-key.\n",
         "",
     )
     admin.answers[("GET", "/secrets")] = (200, {"secrets": []})
-    assert cli(["secret", "list", "--socket", "x"]) == (
-        EXIT_OK,
-        "",
-        "No secrets stored. Store one with: zoeymcp secret set NAME\n",
+    empty = (EXIT_OK, "", f"No secrets stored. Store one with: {HOST} zoeymcp secret set NAME\n")
+    assert cli(["secret", "list", "--socket", "x"]) == empty
+    # D14: list is the default action, and --socket goes before it.
+    assert cli(["secret", "--socket", "x"]) == empty
+    assert cli(["secret", "--socket", "x", "list"]) == empty
+
+
+def secret_entry(name: str, **more: Any) -> dict[str, Any]:
+    binding = {"origins": ["https://api.example:443"]}
+    return {"name": name, "binding": binding, "updated": "2026-11-05T00:00:00Z", **more}
+
+
+def test_deleting_a_secret_the_policy_uses_asks(admin: FakeAdmin) -> None:
+    """D9: ``secret delete`` of a secret the policy uses (``used`` in the list) asks at a
+    terminal, and off one does nothing without --yes; one it doesn't use, or isn't stored, goes
+    ahead; --yes doesn't list first."""
+    listed = [secret_entry("notes-key", used=True), secret_entry("old-key", used=False)]
+    admin.answers[("GET", "/secrets")] = (200, {"secrets": listed})
+    admin.answers[("DELETE", "/secrets/notes-key")] = (200, {})
+    admin.answers[("DELETE", "/secrets/old-key")] = (200, {})
+    admin.answers[("DELETE", "/secrets/gone")] = (404, {"error": "no such secret"})
+    question = (
+        "The policy uses notes-key: what needs it fails until it is stored again. Delete it? [y/N] "
     )
+    argv = ["secret", "delete", "notes-key", "--socket", "x"]
+    assert cli(argv, Typed("n\n")) == (EXIT_FINDINGS, "", question + "Nothing deleted.\n")
+    assert cli(argv, Typed("y\n")) == (EXIT_OK, "Deleted notes-key.\n", question)
+    assert cli(argv) == (
+        EXIT_FINDINGS,
+        "",
+        "Nothing deleted: standard input isn't a terminal, so there is no answer to read. Run "
+        "this again with --yes.\n",
+    )
+    assert [method for method, _, _ in admin.requests] == ["GET", "GET", "DELETE", "GET"]
+    admin.requests.clear()
+    assert cli(["secret", "delete", "old-key", "--socket", "x"]) == (
+        EXIT_OK,
+        "Deleted old-key.\n",
+        "",
+    )
+    assert cli(["secret", "delete", "gone", "--socket", "x"]) == (
+        EXIT_FINDINGS,
+        "",
+        "zoeymcp secret: no such secret\n",
+    )
+    assert cli(["secret", "delete", "notes-key", "--yes", "--socket", "x"])[0] == EXIT_OK
+    assert [method for method, _, _ in admin.requests] == [
+        "GET",
+        "DELETE",
+        "GET",
+        "DELETE",
+        "DELETE",
+    ]
+    # An older vault's list, without used: asked about, as if the policy used it.
+    admin.answers[("GET", "/secrets")] = (200, {"secrets": [secret_entry("notes-key")]})
+    assert cli(argv)[0] == EXIT_FINDINGS
 
 
 def test_a_name_refused_lists_the_known_ones() -> None:
@@ -5048,8 +5253,285 @@ def test_a_lockout_plan_names_the_export_edit_import() -> None:
     import."""
     from zoeymcp.cli import approver as approver_cli
 
-    assert approver_cli.LOCKOUT == (
+    assert approver_cli.lockout_line(admin_client.Prefix()) == (
         "This plan has a lockout row, so nothing was written: add the lines above to an export "
-        "(zoeymcp policy export > policy.yaml), then run zoeymcp policy import - < policy.yaml, "
-        "which shows the row and asks."
+        f"({HARDENED} exec -T vault zoeymcp policy export > policy.yaml), then run {HARDENED} "
+        "exec -T vault zoeymcp policy import - < policy.yaml, which shows the row and asks."
     )
+
+
+# --- UX pass 9: ways out as commands (D4), confirmations (D9), onboard (D11), actions (D14) ----
+
+
+def test_a_prefix_runs_a_command_each_way() -> None:
+    """D4: every way out goes through one prefix: exec, a one-off container (-T when piped),
+    the service recreated, restarted or sent SIGHUP; zoeymcp's own words shell-quoted."""
+    prefix = admin_client.Prefix("dc", "vault")
+    assert prefix.line("x", "run", piped=True) == "dc run --rm --no-deps -T vault x"
+    assert prefix.line("x", "run_mount", piped=True) == (
+        'dc run --rm --no-deps -T -v "$PWD:/w:ro" vault x'
+    )
+    assert prefix.line("", "hup") == "dc kill -s HUP vault"
+    assert prefix.line("", "restart") == "dc restart vault"
+    assert prefix.line("", "up") == "dc up -d vault"
+    assert prefix.zoeymcp("secret", "set", "a key") == "dc exec vault zoeymcp secret set 'a key'"
+    assert (
+        prefix.zoeymcp("policy", "export", piped=True) == "dc exec -T vault zoeymcp policy export"
+    )
+
+
+@pytest.mark.parametrize(
+    ("environ", "role", "said"),
+    [
+        ({}, "vault", f"{HARDENED} exec vault"),
+        ({}, "gateway", f"{HARDENED} exec gateway"),
+        ({admin_client.EXEC_SERVICE_ENV: "gateway"}, "vault", f"{HARDENED} exec vault"),
+        ({admin_client.EXEC_SERVICE_ENV: "vault"}, "vault", f"{HARDENED} exec vault"),
+        (
+            {
+                admin_client.EXEC_SERVICE_ENV: "zoeymcp",
+                admin_client.COMPOSE_CMD_ENV: "docker compose -f deploy/compose.yaml",
+            },
+            "gateway",
+            "docker compose -f deploy/compose.yaml exec zoeymcp",
+        ),
+        ({admin_client.EXEC_SERVICE_ENV: "my vault"}, "vault", f"{HARDENED} exec vault"),
+    ],
+)
+def test_a_way_out_runs_in_the_roles_container(
+    environ: dict[str, str], role: str, said: str
+) -> None:
+    """D4: a hint names the role's own service: this container's when it is that role's, or the
+    standard tier's one service, which runs both; else the hardened file's."""
+    assert admin_client.Prefix.for_role(role, environ).line("zoeymcp", "exec") == (
+        f"{said} zoeymcp"
+    )
+
+
+def test_on_host_reads_this_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert admin_client.on_host("health") == f"{HOST} zoeymcp health"
+    monkeypatch.setenv(admin_client.COMPOSE_CMD_ENV, "docker compose -f deploy/compose.yaml")
+    monkeypatch.setenv(admin_client.EXEC_SERVICE_ENV, "zoeymcp")
+    assert admin_client.on_host("ledger", "vault", role="vault", piped=True) == (
+        "docker compose -f deploy/compose.yaml exec -T zoeymcp zoeymcp ledger vault"
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "text"),
+    [
+        (
+            {"kind": "reload_vault"},
+            f"run: {HARDENED} kill -s HUP vault, or restart it: {HARDENED} restart vault",
+        ),
+        ({"kind": "read_ledger"}, f"run: {HOST} zoeymcp ledger vault"),
+        ({"kind": "review", "server": "notes"}, f"run: {HOST} zoeymcp review notes"),
+        (
+            {"kind": "import_from_env"},
+            f"remove ZOEYMCP_CONFIG, or run: {HOST} zoeymcp policy import --from-env",
+        ),
+        (
+            {"kind": "acknowledge_restore"},
+            f"re-apply and review as it says, then run: {HOST} zoeymcp policy acknowledge-restore",
+        ),
+    ],
+)
+def test_every_health_action_that_runs_names_the_command(action: dict[str, str], text: str) -> None:
+    """D4: no "send SIGHUP to the vault": the reload as typed on the host."""
+    assert health_action(action) == text
+
+
+def test_health_actions_in_the_standard_tier() -> None:
+    """D4: in the standard tier's one service, its own compose file and service name."""
+    prefix = admin_client.Prefix("docker compose -f deploy/compose.yaml", "zoeymcp")
+    restart = {"kind": "restart", "connector": "mail", "ref": "env:MAIL_USER"}
+    assert health_action(restart, prefix) == (
+        "set MAIL_USER in the vault's environment, then recreate it: docker compose -f "
+        "deploy/compose.yaml up -d zoeymcp"
+    )
+    again = {"kind": "onboard_again", "credential": "n", "command": "zoeymcp onboard U"}
+    assert health_action(again, prefix) == (
+        "run: docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp onboard U"
+    )
+
+
+def test_the_policy_head_names_its_ways_on(admin: FakeAdmin) -> None:
+    """D4: a restore the witness shows and a revision saved but not running each end in the
+    command that deals with it, as typed on the host."""
+    head = {
+        "mode": "managed",
+        "revision": 3,
+        "digest8": "abcdef01",
+        "deployment8": "01234567",
+        "created": 1_760_000_000,
+        "origin": "host",
+        "kind": "policy.import",
+        "author": {"by": "host", "via": "socket"},
+        "witness": {"revision": 3, "target": 4},
+        "gateway": {"state": "current", "revision": 3},
+        "not_running": 3,
+    }
+    admin.answers[("GET", "/policy")] = (200, head)
+    code, out, err = cli(["policy", "--socket", "x"])
+    assert (code, err) == (EXIT_OK, "")
+    assert out.splitlines()[-2:] == [
+        f"The gateway's witness shows a restore (revision 4): see {HOST} zoeymcp health, then "
+        f"run: {HOST} zoeymcp policy acknowledge-restore",
+        f"Revision 3 is saved but not running: run {HARDENED} kill -s HUP vault, or restart it: "
+        f"{HARDENED} restart vault",
+    ]
+    # D14: the command takes --format for its default action.
+    code, out, _ = cli(["policy", "--format", "json", "--socket", "x"])
+    assert (code, json.loads(out)) == (EXIT_OK, head)
+
+
+def test_the_policy_history_names_its_next_page(admin: FakeAdmin) -> None:
+    """D4: "More:" is the next page's command as typed on the host."""
+    page = {"revisions": [], "next": 7}
+    admin.answers[("GET", "/policy/revisions?limit=1")] = (200, page)
+    code, out, _ = cli(["policy", "history", "--limit", "1", "--socket", "x"])
+    assert (code, out) == (EXIT_OK, f"More: {HOST} zoeymcp policy history --before 7\n")
+
+
+def test_a_managed_check_names_the_standard_tiers_pipe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """D4: the export and the one-off check in the service the compose file names."""
+    monkeypatch.setenv(admin_client.COMPOSE_CMD_ENV, "docker compose -f deploy/compose.yaml")
+    monkeypatch.setenv(admin_client.EXEC_SERVICE_ENV, "zoeymcp")
+    _, _, err = cli(["check", "--config", "-"], io.StringIO(managed_example()))
+    standard = "docker compose -f deploy/compose.yaml"
+    assert err == (
+        "zoeymcp check: checking this document, not the running revision: to check what runs, "
+        f"pipe the export into it: {standard} exec -T zoeymcp zoeymcp policy export | {standard} "
+        "run --rm --no-deps -T zoeymcp check --config -\n"
+    )
+
+
+def test_confirmed_reads_a_terminal_and_names_yes_off_one() -> None:
+    """D9: [y/N] at a terminal, y or yes; off one, nothing done and --yes named; --yes asks
+    nothing."""
+    err = io.StringIO()
+    assert admin_client.confirmed("Go?", yes=True, stdin=io.StringIO(), err=err, nothing="No")
+    assert err.getvalue() == ""
+    for typed, answer in (("y\n", True), ("YES\n", True), ("\n", False), ("no\n", False)):
+        err = io.StringIO()
+        said = admin_client.confirmed("Go?", yes=False, stdin=Typed(typed), err=err, nothing="No")
+        assert said is answer
+        assert err.getvalue() == "Go? [y/N] " + ("" if answer else "No.\n")
+    err = io.StringIO()
+    assert not admin_client.confirmed(
+        "Go?", yes=False, stdin=io.StringIO("y\n"), err=err, nothing="Nothing done"
+    )
+    assert err.getvalue() == (
+        "Nothing done: standard input isn't a terminal, so there is no answer to read. Run this "
+        "again with --yes.\n"
+    )
+
+
+def test_onboard_is_login_mcp(onboard_admin: FakeAdmin) -> None:
+    """D11: ``zoeymcp onboard URL`` is the onboarding command; ``login --mcp URL`` its alias,
+    the same requests and lines, named by the command typed."""
+    argv = ["onboard", URL, "--name", "notes", "--client-id", "zc_given", "--yes", "--socket", "x"]
+    onboarded = cli(argv)
+    requests = list(onboard_admin.requests)
+    onboard_admin.requests.clear()
+    assert cli([*PUBLIC_ARGV, "--yes"]) == onboarded
+    assert onboard_admin.requests == requests
+    assert onboarded[:2] == (EXIT_OK, FRAGMENT)
+    code, out, err = cli(["onboard", URL, "--client-secret=hunter2", "--socket", "x"])
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err.startswith("zoeymcp onboard: a client secret is never an argument")
+    assert "hunter2" not in err
+    onboard_admin.answers[("GET", "/policy")] = (200, {"mode": "managed", "revision": 1})
+    code, _, err = cli(["onboard", URL, "--socket", "x"])
+    assert (code, err.startswith("zoeymcp onboard: ")) == (EXIT_FINDINGS, True)
+
+
+def test_the_onboarding_options_are_onboards() -> None:
+    """D11: ``onboard --help`` lists them, with help on --credential, --route and --server;
+    ``login --help`` doesn't, and says login --mcp is the alias."""
+    parser = main_module._build_parser()
+    with contextlib.redirect_stdout(io.StringIO()) as shown, pytest.raises(SystemExit):
+        parser.parse_args(["onboard", "--help"])
+    text = shown.getvalue()
+    for flag in ("--credential C", "--route R", "--server S"):
+        assert re.search(rf"^  {flag}\s+the name of the ", text, re.MULTILINE), flag
+    with contextlib.redirect_stdout(io.StringIO()) as shown, pytest.raises(SystemExit):
+        parser.parse_args(["login", "--help"])
+    text = shown.getvalue()
+    assert "--credential" not in text
+    assert "login --mcp URL is the alias of zoeymcp onboard URL" in text
+    groups = [name for _, members in main_module.COMMAND_GROUPS for name, _ in members]
+    assert "onboard" in groups
+
+
+def test_oauth_takes_status_by_default(admin: FakeAdmin) -> None:
+    """D14: ``zoeymcp oauth`` is ``oauth status``."""
+    admin.answers[("GET", "/oauth")] = (200, {"credentials": []})
+    assert cli(["oauth", "--socket", "x"]) == (EXIT_OK, "", f"{main_module.NO_OAUTH}\n")
+    admin.answers[("GET", "/oauth")] = (503, {"error": "stopping"})
+    assert cli(["oauth", "--socket", "x"]) == (
+        EXIT_UNREADABLE,
+        "",
+        "zoeymcp oauth status: stopping\n",
+    )
+
+
+def gateway_records() -> list[dict[str, Any]]:
+    from tests.unit.test_ledgerjoin import REF_A, T, asked
+
+    return [asked(1, T, REF_A, client="agent\x1b[2J")]
+
+
+LISTING = "/ledger?after=-1&limit=10000"
+
+
+def test_the_ledgers_actions_and_their_flag_forms(admin: FakeAdmin) -> None:
+    """D14: ``ledger list|verify|check`` and ``ledger vault``, and the flag forms before the
+    actions; D19: the gateway's listing goes through the escaping writer like every other."""
+    admin.answers[("GET", LISTING)] = (200, {"records": gateway_records()})
+    code, out, err = cli(["ledger", "--socket", "x"])
+    assert (code, err) == (EXIT_OK, "")
+    assert "agent[U+001B][2J" in out
+    assert "\x1b" not in out
+    assert cli(["ledger", "list", "--socket", "x"]) == (code, out, err)
+    assert cli(["ledger", "--socket", "x", "list", "--format", "json"])[1].startswith('{"')
+    verified = {"ok": False, "records": 3, "head_seq": 2, "head_hash": "sha256:a", "broken_at": 1}
+    admin.answers[("POST", "/ledger/verify")] = (200, verified)
+    said = (
+        EXIT_FINDINGS,
+        "broken at seq 1: 3 records chain before it; head seq 2, hash sha256:a\n",
+        "",
+    )
+    assert cli(["ledger", "verify", "--socket", "x"]) == said
+    assert cli(["ledger", "--verify", "--socket", "x"]) == said
+    admin.answers[("GET", "/ledger/reported")] = (200, PAGE)
+    assert cli(["ledger", "vault", "--socket", "x"])[1].splitlines() == PAGE_LINES
+    assert cli(["ledger", "--socket", "x", "vault"])[1].splitlines() == PAGE_LINES
+    # A gateway listing's filter given to the vault's copy, before the action.
+    assert cli(["ledger", "--since", "7d", "vault", "--socket", "x"]) == (
+        EXIT_UNREADABLE,
+        "",
+        "zoeymcp ledger: ledger vault takes only --restart-chain, --before, --chain, --verify "
+        "and --format\n",
+    )
+    assert cli(["ledger", "--before", "3", "--socket", "x"]) == (
+        EXIT_UNREADABLE,
+        "",
+        "zoeymcp ledger: --restart-chain, --before and --chain go with ledger vault\n",
+    )
+
+
+def test_a_ledger_check_reads_its_file(admin: FakeAdmin, tmp_path: Path) -> None:
+    ref = "3f9c0a17b2d4e681"
+    admin.answers[("POST", "/ledger/check")] = (200, {"ref": ref, "found": True, "matches": True})
+    good = tmp_path / "args.json"
+    good.write_text('{"a": 1}', encoding="utf-8")
+    assert cli(["ledger", "check", ref, str(good), "--socket", "x"]) == (
+        EXIT_OK,
+        f"{ref}: the call had exactly these arguments\n",
+        "",
+    )
+    assert admin.requests[-1] == ("POST", "/ledger/check", {"ref": ref, "args": {"a": 1}})
+    code, out, err = cli(["ledger", "check", ref, str(tmp_path / "none.json"), "--socket", "x"])
+    assert (code, out) == (EXIT_UNREADABLE, "")
+    assert err.startswith(f"zoeymcp ledger check: can't read {tmp_path / 'none.json'}: ")

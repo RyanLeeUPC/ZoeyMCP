@@ -9,6 +9,7 @@ import difflib
 import json
 import os
 import secrets
+import shlex
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -58,50 +59,63 @@ KEYGEN_NOTE = (
     "Set ZOEYMCP_MASTER_KEY in the vault's environment and keep a copy; the hardened tier's "
     "gateway takes ZOEYMCP_GATEWAY_KEY, which the standard tier doesn't need. Nothing was written."
 )
-NO_SECRETS = "No secrets stored. Store one with: zoeymcp secret set NAME"
-NO_PASSKEYS = "No passkeys: the portal waits for a setup code. Issue one with: zoeymcp setup-code"
+# The empty states, each with its way on, as typed on the host (D4): {zoeymcp} is the prefix.
+NO_SECRETS = "No secrets stored. Store one with: {zoeymcp} secret set NAME"
+NO_PASSKEYS = "No passkeys: the portal waits for a setup code. Issue one with: {zoeymcp} setup-code"
 NO_OAUTH = "No oauth2 credentials in the policy."
 # The source read_source names when no policy was given.
 NO_SOURCE = "(none)"
-# How the CLI words each health action (M5 design I.1).
+# How the CLI words each health action (M5 design I.1): a command as typed on the host (D4), in
+# the vault's container ({zoeymcp}, the vault's prefix and zoeymcp), or sent to its service
+# ({hup}, {restart}, {up}); {command}, a command the vault names, after the same prefix.
 HEALTH_ACTIONS = {
-    "connect": "run: zoeymcp login {credential}",
-    "reset": "run: zoeymcp oauth reset {credential}",
-    "set_secret": "run: zoeymcp secret set {secret}",
-    "restart": "set env {var} and restart the vault",
-    "delete_secret": "run: zoeymcp secret delete {secret}",
+    "connect": "run: {zoeymcp} login {credential}",
+    "reset": "run: {zoeymcp} oauth reset {credential}",
+    "set_secret": "run: {zoeymcp} secret set {secret}",
+    "restart": "set {var} in the vault's environment, then recreate it: {up}",
+    "delete_secret": "run: {zoeymcp} secret delete {secret}",
     "fix_policy": "fix the policy",
     "wait": "wait: it clears with time",
     "check_volume": "check the state volume",
     "check_mailbox": "check the mailbox for the sends with an unknown outcome",
     "check_gateway": "check that the gateway runs and reaches the vault",
-    "read_ledger": "run: zoeymcp ledger --vault",
-    "list_approvals": "run: zoeymcp approvals list",
-    "add_passkey": "run: zoeymcp setup-code, and enrol a second passkey with it",
-    "review_passkeys": "run: zoeymcp passkeys, and remove any you don't recognize",
-    "reset_passkeys": "run: zoeymcp setup-code --reset",
+    "read_ledger": "run: {zoeymcp} ledger vault",
+    "list_approvals": "run: {zoeymcp} approvals list",
+    "add_passkey": "run: {zoeymcp} setup-code, and enrol a second passkey with it",
+    "review_passkeys": "run: {zoeymcp} passkeys list, and remove any you don't recognize",
+    "reset_passkeys": "run: {zoeymcp} setup-code --reset",
     "onboard_again": "run: {command}",
     "widen_scope": (
         'merge credentials.{credential}.scope: "{scope}" (the fragment is in health --json), '
-        "check and reload the policy, then run: zoeymcp login {credential}"
+        "check and reload the policy, then run: {zoeymcp} login {credential}"
     ),
     "check_egress_role": (
         "check that the egress role runs, reaches the vault, and has the key zoeymcp egress-key "
         "prints"
     ),
-    "review": "run: zoeymcp review {server}",
-    "reload_vault": "send SIGHUP to the vault, or restart it",
-    "import_from_env": "remove ZOEYMCP_CONFIG, or run: zoeymcp policy import --from-env",
-    "acknowledge_restore": "re-apply and review as it says, then run: zoeymcp policy "
+    "review": "run: {zoeymcp} review {server}",
+    "reload_vault": "run: {hup}, or restart it: {restart}",
+    "import_from_env": "remove ZOEYMCP_CONFIG, or run: {zoeymcp} policy import --from-env",
+    "acknowledge_restore": "re-apply and review as it says, then run: {zoeymcp} policy "
     "acknowledge-restore",
 }
 
 # check and selftest of a managed document, on stderr (M6 design M.6): they run in a throwaway
 # container with no socket, so what they read is the document they are given, never the head.
+# The way on is the export piped into the same command (D4): {export} | {command}.
 NOT_THE_HEAD = (
-    "checking this document, not the running revision: to check what runs, pipe zoeymcp policy "
-    "export into this command with --config -"
+    "checking this document, not the running revision: to check what runs, pipe the export "
+    "into it: {export} | {command}"
 )
+
+
+def not_the_head(words: Sequence[str], prefix: admin_client.Prefix) -> str:
+    """:data:`NOT_THE_HEAD` with its commands as typed on the host: the vault's export, piped
+    into ``zoeymcp WORDS`` in a one-off container of the same service."""
+    export = prefix.zoeymcp("policy", "export", piped=True)
+    command = prefix.line(shlex.join(words), "run", piped=True)
+    return NOT_THE_HEAD.format(export=export, command=command)
+
 
 # The image's second virtual environment, the only one with the gateway's dependencies.
 GATEWAY_ENVIRONMENT = Path("/opt/zoeymcp-gateway")
@@ -164,7 +178,8 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         (
             ("setup-code", "issue a one-time code that enrols a portal passkey"),
             ("secret", "store, list or delete the secrets the policy names"),
-            ("login", "sign in to an OAuth credential, or onboard an MCP server by URL"),
+            ("onboard", "onboard a remote MCP server by URL (declarative mode)"),
+            ("login", "connect an OAuth credential, as the portal's Connect does"),
             ("egress-key", "print the egress role's key (hardened tier)"),
         ),
     ),
@@ -178,10 +193,13 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
                 "gateway-status",
                 "the gateway's view, each server's state (in the gateway's container)",
             ),
-            ("ledger", "the approval ledger (in the gateway's container; --vault in the vault's)"),
+            (
+                "ledger",
+                "the approval ledger (in the gateway's container; ledger vault: the vault's)",
+            ),
             ("oauth", "the OAuth credentials' state, and a reset after a failure"),
-            ("passkeys", "list the portal's passkeys, or remove one"),
-            ("sessions", "list the portal's sessions, or end them all"),
+            ("passkeys", "the portal's passkeys: list, remove"),
+            ("sessions", "the portal's sessions: list, end"),
             ("approver", "enrol the Telegram approver, or test it"),
             ("gateway-key", "print the gateway key, for a rotation"),
         ),
@@ -241,6 +259,156 @@ class _Once(argparse.Action):
 
 FORMAT_HELP = "text (the default), or json: one JSON document on stdout"
 VAULT_SOCKET_HELP = f"the vault's admin socket (default ${SOCKET_ENV} or {DEFAULT_SOCKET})"
+# Every --state that works on a state directory instead of the admin socket (D21).
+STATE_HELP = "offline: the vault's state directory, with the vault stopped"
+
+
+def _onboarding_options(parser: argparse.ArgumentParser, *, hidden: bool) -> None:
+    """``onboard``'s options, which ``login --mcp`` takes too, unlisted in its help (D11)."""
+
+    def said(text: str) -> str:
+        return argparse.SUPPRESS if hidden else text
+
+    group = parser.add_argument_group("onboarding by URL")
+    group.add_argument(
+        "--name",
+        metavar="NAME",
+        help=said("the credential, route and server name (default: from the host's name)"),
+    )
+    group.add_argument(
+        "--credential",
+        dest="credential_name",
+        metavar="C",
+        help=said(
+            "the name of the oauth2 credential it creates, the one zoeymcp login C connects "
+            "(default: --name)"
+        ),
+    )
+    group.add_argument(
+        "--route",
+        metavar="R",
+        help=said("the name of the route it creates, which sends the credential (default: --name)"),
+    )
+    group.add_argument(
+        "--server",
+        metavar="S",
+        help=said(
+            "the name of the gateway server it creates, as agents and review name it "
+            "(default: --name)"
+        ),
+    )
+    group.add_argument(
+        "--issuer",
+        metavar="ISSUER",
+        help=said("the authorization server to use; needed with --client-secret"),
+    )
+    group.add_argument(
+        "--scope",
+        metavar='"TOKEN ..."',
+        help=said("the scopes to request, instead of the server's"),
+    )
+    group.add_argument(
+        "--client-name", metavar="TEXT", help=said("the client's name at the provider")
+    )
+    group.add_argument(
+        "--client-id", metavar="ID", help=said("a client registered at the provider already")
+    )
+    group.add_argument(
+        "--client-secret",
+        action=_NoValue,
+        help=said(
+            "the client has a secret: read from a hidden prompt, or with --yes from stdin, "
+            "never from the command line"
+        ),
+    )
+    group.add_argument(
+        "--client-auth",
+        choices=("basic", "post"),
+        help=said("how the client sends its secret (default basic)"),
+    )
+    group.add_argument(
+        "--redirect-uri",
+        metavar="URL",
+        help=said("the redirect address the provider has on record"),
+    )
+    group.add_argument(
+        "--callback-origin",
+        metavar="ORIGIN",
+        help=said(
+            "register the client with this admin.origins portal's callback, not the paste one"
+        ),
+    )
+    group.add_argument(
+        "--allow-private",
+        action="store_true",
+        help=said("the server is on your network: its own host:port may resolve privately"),
+    )
+    group.add_argument(
+        "--plan-only",
+        action="store_true",
+        help=said("show the plan, then stop; nothing is stored"),
+    )
+    group.add_argument(
+        "--yes",
+        action="store_true",
+        help=said("don't ask; needed when a client secret is piped in"),
+    )
+    group.add_argument(
+        "--reregister",
+        action="store_true",
+        help=said("register a new client for the committed credential, under its names"),
+    )
+    group.add_argument(
+        "--no-connect",
+        action="store_true",
+        help=said("after the commit: compare only, don't connect (an adopted grant)"),
+    )
+    group.add_argument(
+        "--squid-src",
+        action="append",
+        default=[],
+        metavar="vault=ACL",
+        help=said("the Squid src ACL for the vault in the lines a proxy refusal prints"),
+    )
+    layout = group.add_mutually_exclusive_group()
+    layout.add_argument(
+        "--indent",
+        type=int,
+        metavar="N",
+        help=said(f"indent fragment 1's lines N spaces (0 to {policy_emit.INDENT_MAX})"),
+    )
+    layout.add_argument(
+        "--for",
+        dest="target",
+        choices=("compose",),
+        help=said("fragment 1 in the compose form, indented 8 with every $ written $$"),
+    )
+    group.add_argument("--format", choices=("text", "json"), help=said(FORMAT_HELP))
+
+
+def socket_option(
+    parser: argparse.ArgumentParser, *, under: bool = False, help: str = VAULT_SOCKET_HELP
+) -> None:
+    """``--socket`` on a command, or (``under``) on one of its actions too. An action's own
+    default would replace the command's value (argparse sets an action's defaults last), so an
+    action's has none: ``zoeymcp approvals --socket S list`` keeps S (D14)."""
+    extra: dict[str, Any] = {"default": argparse.SUPPRESS} if under else {}
+    parser.add_argument("--socket", metavar="PATH", help=help, **extra)
+
+
+def format_option(
+    parser: argparse.ArgumentParser, *, under: bool = False, help: str = FORMAT_HELP
+) -> None:
+    """``--format text|json`` on a command, or (``under``) on one of its actions too, as
+    :func:`socket_option`: ``zoeymcp approvals --format json`` is the list's JSON (D14)."""
+    extra: dict[str, Any] = {"default": argparse.SUPPRESS} if under else {"default": "text"}
+    parser.add_argument("--format", choices=("text", "json"), help=help, **extra)
+
+
+def yes_option(parser: argparse.ArgumentParser, help: str, *, under: bool = False) -> None:
+    """``--yes``: a destructive command's answer, for a script (D9)."""
+    extra: dict[str, Any] = {"default": argparse.SUPPRESS} if under else {}
+    parser.add_argument("--yes", action="store_true", help=help, **extra)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -298,10 +466,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="the Squid src ACL naming SOURCE's network, over the policy's egress_proxy_acls",
     )
     check.add_argument(
+        "--compare",
         "--check",
         dest="compare",
         metavar="FILE",
-        help="with --emit-egress-allowlist: compare FILE with the output; exit 1 if it differs",
+        help="with --emit-egress-allowlist: compare FILE with the output; exit 1 if it differs "
+        "(--check is the same)",
     )
     check.add_argument(
         "--with",
@@ -604,11 +774,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "secret",
         "Store, list or delete the secrets the policy names (in the vault's container).\n"
         "A value is never printed, and never read from the command line.",
+        "With no action, list (the default).\n\n"
         "Examples:\n"
         "  printf '%s' \"$API_KEY\" | zoeymcp secret set notes-key\n"
-        "  zoeymcp secret list",
+        "  zoeymcp secret\n"
+        "  zoeymcp secret delete old-key",
     )
-    secret_commands = secret.add_subparsers(dest="action", required=True, metavar="action")
+    socket_option(secret)
+    secret_commands = secret.add_subparsers(dest="action", metavar="action")
     secret_set = secret_commands.add_parser(
         "set",
         help="store or replace a secret; the value is read from stdin or a hidden prompt",
@@ -637,15 +810,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     secret_commands.add_parser(
         "list",
-        help="list secret names and bindings (never values)",
+        help="list secret names and bindings, never values (the default)",
         description="Each secret's name, when it was updated and its binding; never a value.",
     )
     secret_delete = secret_commands.add_parser(
         "delete",
         help="delete a secret",
-        description="Delete a secret from the store (in the vault's container). It doesn't ask.",
+        description="Delete a secret from the store (in the vault's container). One the policy\n"
+        "uses is asked about first at a terminal; give --yes in a script.",
+        formatter_class=_Formatter,
     )
     secret_delete.add_argument("name", help="the secret to delete")
+    yes_option(secret_delete, "delete it without asking, even when the policy uses it")
 
     selftest = command(
         "selftest",
@@ -681,28 +857,68 @@ def _build_parser() -> argparse.ArgumentParser:
     setup_code.add_argument(
         "--state",
         metavar="DIR",
-        help="write the code into this state directory, without the admin socket",
+        help="offline: write the code into the vault's state directory, with the vault stopped",
     )
     passkeys = command(
         "passkeys",
         "List the portal's passkeys: fingerprint, how and where each was enrolled, when last used\n"
-        "(in the vault's container). --remove takes one out, the last one too; it doesn't ask.",
-        "With no passkey left, the portal waits for a setup code (zoeymcp setup-code).",
+        "(in the vault's container), or remove one, the last one too.",
+        "With no action, list (the default). remove asks first at a terminal; give --yes in a\n"
+        "script. With no passkey left, the portal waits for a setup code (zoeymcp setup-code).\n\n"
+        "Examples:\n"
+        "  zoeymcp passkeys\n"
+        "  zoeymcp passkeys remove 3f9c0a17b2d4e681",
     )
-    passkeys.add_argument(
-        "--remove", metavar="FINGERPRINT", help="remove this passkey and end its sessions"
+    socket_option(passkeys)
+    # The flag forms before passkeys took actions (D14), kept for scripts.
+    passkeys.add_argument("--remove", metavar="FINGERPRINT", help=argparse.SUPPRESS)
+    passkeys.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
+    passkeys_commands = passkeys.add_subparsers(dest="action", metavar="action")
+    passkeys_list = passkeys_commands.add_parser(
+        "list", help="the passkeys (the default)", description="The portal's passkeys."
     )
+    passkeys_remove = passkeys_commands.add_parser(
+        "remove",
+        help="remove a passkey and end its sessions",
+        description="Remove a passkey and end its sessions. It asks first at a terminal, and\n"
+        "says so when it is the last one: the portal then waits for a setup code.",
+        formatter_class=_Formatter,
+    )
+    passkeys_remove.add_argument(
+        "remove", metavar="FINGERPRINT", help="the passkey, as passkeys lists it (16 hex digits)"
+    )
+    yes_option(passkeys_remove, "remove it without asking", under=True)
+    for sub in (passkeys_list, passkeys_remove):
+        socket_option(sub, under=True)
     sessions = command(
         "sessions",
-        "List the portal's sessions, one a line, or end them all (in the vault's container).\n"
-        "--end-all ends every session, including any you are signed in with; it doesn't ask.",
+        "List the portal's sessions, one a line, or end them all (in the vault's container).",
+        "With no action, list (the default). end ends every session, including any you are\n"
+        "signed in with; it asks first at a terminal; give --yes in a script.\n\n"
+        "Examples:\n"
+        "  zoeymcp sessions\n"
+        "  zoeymcp sessions end --yes",
     )
-    sessions.add_argument(
-        "--end-all",
-        action="store_true",
+    format_option(sessions)
+    socket_option(sessions)
+    # The flag form before sessions took actions (D14), kept for scripts.
+    sessions.add_argument("--end-all", action="store_true", help=argparse.SUPPRESS)
+    sessions.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
+    sessions_commands = sessions.add_subparsers(dest="action", metavar="action")
+    sessions_list = sessions_commands.add_parser(
+        "list", help="the sessions (the default)", description="The portal's sessions, one a line."
+    )
+    sessions_end = sessions_commands.add_parser(
+        "end",
         help="end every portal session, including any you are signed in with",
+        description="End every portal session, including any you are signed in with. It asks\n"
+        "first at a terminal.",
+        formatter_class=_Formatter,
     )
-    sessions.add_argument("--format", choices=("text", "json"), default="text", help=FORMAT_HELP)
+    yes_option(sessions_end, "end them without asking", under=True)
+    for sub in (sessions_list, sessions_end):
+        format_option(sub, under=True)
+        socket_option(sub, under=True)
     gateway_key = command(
         "gateway-key",
         "Print the gateway key for the current gateway_key_generation (in the vault's container).\n"
@@ -848,66 +1064,115 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ledger = command(
         "ledger",
-        "List the approval ledger, one line per call: when, ref, client, server/tool, era,\n"
-        "decision, outcome (in the gateway's container). Never argument values or prompt text.",
-        "--verify walks the hash chain and prints its head, to compare with the last anchor in\n"
-        "the logs. 'ledger check REF FILE' proves whether FILE (JSON) holds the arguments that\n"
-        "call was made with, without the key leaving the gateway.\n"
-        "--vault reads the vault's copy instead (in the vault's container), which the gateway\n"
+        "The approval ledger: list it, one line per call (when, ref, client, server/tool, era,\n"
+        "decision, outcome), verify its chain or check a call's arguments (in the gateway's\n"
+        "container). Never argument values or prompt text.",
+        "With no action, list (the default). verify walks the hash chain and prints its head,\n"
+        "to compare with the last anchor in the logs. check REF FILE proves whether FILE (JSON)\n"
+        "holds the arguments that call was made with, without the key leaving the gateway.\n"
+        "vault reads the vault's copy instead (in the vault's container), which the gateway\n"
         "reports to it, joined with the vault's own approval chain. --restart-chain archives that\n"
         "copy's chain after a fork, gap or full, once you have decided why; it asks first.\n\n"
         "Examples:\n"
         "  zoeymcp ledger --since 7d --server notes\n"
         "  zoeymcp ledger check 3f9c0a17b2d4e681 args.json\n"
-        "  zoeymcp ledger --vault --chain both",
+        "  zoeymcp ledger vault --chain both",
     )
-    ledger.add_argument(
-        "action", nargs="?", metavar="check", help="check: prove a call's arguments"
+    gateway_socket_help = (
+        f"the gateway's admin socket (default ${admin_client.GATEWAY_SOCKET_ENV} or "
+        f"{admin_client.GATEWAY_SOCKET}); with ledger vault or review --via vault, the vault's"
     )
-    ledger.add_argument("ref", nargs="?", help="with check: the call's ref")
-    ledger.add_argument("file", nargs="?", help="with check: a JSON file of the arguments")
-    ledger.add_argument(
-        "--since", metavar="AGE", help="only calls asked within AGE, like 7d, 12h or 30m"
+    ledger_format_help = (
+        "text (the default), or json: one record a line (ledger vault: one document)"
     )
-    ledger.add_argument("--client", metavar="CLIENT", help="only this client's calls")
-    ledger.add_argument("--server", metavar="SERVER", help="only calls to this server")
-    ledger.add_argument("--tool", metavar="TOOL", help="only calls of this tool")
-    ledger.add_argument(
-        "--verify", action="store_true", help="walk the hash chain (with --vault, the vault's)"
+    # The flag forms before ledger took actions (D14), kept for scripts: --verify, --vault and
+    # its options, and list's filters before an action.
+    ledger.set_defaults(ref=None, file=None)
+    ledger.add_argument("--since", metavar="AGE", help=argparse.SUPPRESS)
+    ledger.add_argument("--client", metavar="CLIENT", help=argparse.SUPPRESS)
+    ledger.add_argument("--server", metavar="SERVER", help=argparse.SUPPRESS)
+    ledger.add_argument("--tool", metavar="TOOL", help=argparse.SUPPRESS)
+    ledger.add_argument("--verify", action="store_true", help=argparse.SUPPRESS)
+    ledger.add_argument("--vault", action="store_true", help=argparse.SUPPRESS)
+    ledger.add_argument("--restart-chain", action="store_true", help=argparse.SUPPRESS)
+    ledger.add_argument("--before", type=int, metavar="SEQ", help=argparse.SUPPRESS)
+    ledger.add_argument("--chain", choices=("vault", "copy", "both"), help=argparse.SUPPRESS)
+    format_option(ledger, help=ledger_format_help)
+    socket_option(ledger, help=gateway_socket_help)
+    ledger_commands = ledger.add_subparsers(dest="action", metavar="action")
+    ledger_list = ledger_commands.add_parser(
+        "list",
+        help="one line per call, oldest first (the default)",
+        description="One line per call, oldest first: when, ref, client, server/tool, era,\n"
+        "decision, outcome.",
+        formatter_class=_Formatter,
     )
-    ledger.add_argument(
-        "--format",
-        choices=("text", "json"),
-        default="text",
-        help="text (the default), or json: one record a line (with --vault, one document)",
+    ledger_list.add_argument(
+        "--since",
+        metavar="AGE",
+        default=argparse.SUPPRESS,
+        help="only calls asked within AGE, like 7d, 12h or 30m",
     )
-    ledger.add_argument(
-        "--vault", action="store_true", help="the vault's reported copy (in the vault's container)"
+    for flag, metavar, said in (
+        ("--client", "CLIENT", "only this client's calls"),
+        ("--server", "SERVER", "only calls to this server"),
+        ("--tool", "TOOL", "only calls of this tool"),
+    ):
+        ledger_list.add_argument(flag, metavar=metavar, default=argparse.SUPPRESS, help=said)
+    ledger_verify = ledger_commands.add_parser(
+        "verify",
+        help="walk the hash chain and print its head",
+        description="Walk the hash chain and print its head, to compare with the last anchor in\n"
+        "the logs. Exit 1 when it is broken.",
+        formatter_class=_Formatter,
     )
-    ledger.add_argument(
+    ledger_check = ledger_commands.add_parser(
+        "check",
+        help="prove whether a file holds the arguments a call was made with",
+        description="Prove whether FILE (JSON) holds the arguments the call REF was made with,\n"
+        "without the key leaving the gateway. Exit 1 when it doesn't.",
+        formatter_class=_Formatter,
+    )
+    ledger_check.add_argument("ref", help="the call's ref (16 hex digits)")
+    ledger_check.add_argument("file", help="a JSON file of the arguments")
+    ledger_vault = ledger_commands.add_parser(
+        "vault",
+        help="the vault's reported copy, joined with its own chain (in the vault's container)",
+        description="The vault's copy of the ledger, which the gateway reports to it, joined with\n"
+        "the vault's own approval chain (in the vault's container).",
+        formatter_class=_Formatter,
+    )
+    ledger_vault.add_argument(
+        "--verify",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="walk the vault's own approval chain instead",
+    )
+    ledger_vault.add_argument(
         "--restart-chain",
         action="store_true",
-        help="with --vault: archive the copy's chain after a fork, gap or full (asks first)",
+        default=argparse.SUPPRESS,
+        help="archive the copy's chain after a fork, gap or full (asks first)",
     )
-    ledger.add_argument(
-        "--before", type=int, metavar="SEQ", help="with --vault: the rows before this seq"
+    ledger_vault.add_argument(
+        "--before",
+        type=int,
+        metavar="SEQ",
+        default=argparse.SUPPRESS,
+        help="the rows before this seq",
     )
-    ledger.add_argument(
+    ledger_vault.add_argument(
         "--chain",
         choices=("vault", "copy", "both"),
-        help="with --vault: the vault's own approval chain, the reported copy, or both joined "
-        "(the default)",
+        default=argparse.SUPPRESS,
+        help="the vault's own approval chain, the reported copy, or both joined (the default)",
     )
-    for sub in (review, gateway_status, ledger):
-        sub.add_argument(
-            "--socket",
-            metavar="PATH",
-            help=(
-                f"the gateway's admin socket (default ${admin_client.GATEWAY_SOCKET_ENV} or "
-                f"{admin_client.GATEWAY_SOCKET}); with ledger --vault or review --via vault, "
-                "the vault's"
-            ),
-        )
+    for sub in (ledger_list, ledger_verify, ledger_vault):
+        format_option(sub, under=True, help=ledger_format_help)
+    for sub in (ledger_list, ledger_verify, ledger_check, ledger_vault):
+        socket_option(sub, under=True, help=gateway_socket_help)
+    for sub in (review, gateway_status):
+        socket_option(sub, help=gateway_socket_help)
 
     approvals = command(
         "approvals",
@@ -921,7 +1186,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "  zoeymcp approvals show 3f9c0a17b2d4e681\n"
         "  zoeymcp approvals withdraw --all",
     )
-    approvals.set_defaults(action=None, key=None, all=False, format="text", socket=None)
+    approvals.set_defaults(action=None, key=None, all=False)
+    format_option(approvals)
+    socket_option(approvals)
     approvals_commands = approvals.add_subparsers(dest="action", metavar="action")
     approvals_list = approvals_commands.add_parser(
         "list",
@@ -983,29 +1250,27 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Send a message with no buttons to the operator's chat: exit 0 when Telegram "
         "took it, 1 otherwise.",
     )
-    for sub in (approvals_list, approvals_show, approvals_withdraw, telegram_enrol, telegram_test):
-        sub.add_argument("--format", choices=("text", "json"), default="text", help=FORMAT_HELP)
-        sub.add_argument("--socket", metavar="PATH", help=VAULT_SOCKET_HELP)
+    for sub in (approvals_list, approvals_show, approvals_withdraw):
+        format_option(sub, under=True)
+        socket_option(sub, under=True)
+    for sub in (telegram_enrol, telegram_test):
+        format_option(sub)
+        socket_option(sub)
 
     login = command(
         "login",
-        "Sign in to an OAuth credential: open the printed URL, approve, and paste back the\n"
-        "address the browser was sent to (in the vault's container).",
+        "Connect an OAuth credential: open the printed URL, approve, and paste back the address\n"
+        "the browser was sent to (in the vault's container). The portal's Connect does the same.",
         "The paste is read from a hidden prompt, or one line of stdin. For the client_credentials\n"
-        "grant, login is a test fetch.\n"
-        "With --mcp URL instead of a credential (declarative mode), it onboards the MCP server at\n"
-        "URL: the plan goes to stderr and, confirmed, fragment 1 for the policy to stdout. Run it\n"
-        "again once the fragment is committed, to compare and sign in. In managed mode, add the\n"
-        "server in the portal instead.\n\n"
+        "grant, login is a test fetch. login --mcp URL is the alias of zoeymcp onboard URL, and\n"
+        "takes its options.\n\n"
         "Examples:\n"
         "  zoeymcp login calendar\n"
-        "  zoeymcp login --mcp https://mcp.notes.example/mcp > onboard-notes-1.yaml",
+        "  zoeymcp login calendar --start",
     )
     target = login.add_mutually_exclusive_group(required=True)
-    target.add_argument("credential", nargs="?", help="the oauth2 credential to sign in to")
-    target.add_argument(
-        "--mcp", metavar="URL", help="onboard the MCP server at URL (declarative mode)"
-    )
+    target.add_argument("credential", nargs="?", help="the oauth2 credential to connect")
+    target.add_argument("--mcp", metavar="URL", help="the same as zoeymcp onboard URL")
     login.add_argument(
         "--rebind", action="store_true", help="accept a binding the policy has changed"
     )
@@ -1016,105 +1281,44 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument(
         "--flow", metavar="ID", help="complete a flow from --start; reads the address from stdin"
     )
-    onboard = login.add_argument_group("onboarding by URL (with --mcp)")
-    onboard.add_argument(
-        "--name", metavar="NAME", help="the credential, route and server name (default: the host's)"
+    # login --mcp URL takes onboard's options, unlisted here: onboard --help lists them.
+    _onboarding_options(login, hidden=True)
+
+    onboard = command(
+        "onboard",
+        "Onboard the remote MCP server at URL (declarative mode, in the vault's container): the\n"
+        "plan goes to stderr and, confirmed, fragment 1 for the policy to stdout.",
+        "Run it again once the fragment is committed: it compares what the server publishes with\n"
+        "the policy, connects the credential and reviews the server's tools. In managed mode, add\n"
+        "the server in the portal's MCP servers instead. login --mcp URL is its alias.\n\n"
+        "Examples:\n"
+        "  zoeymcp onboard https://mcp.notes.example/mcp > onboard-notes-1.yaml\n"
+        "  zoeymcp onboard https://mcp.notes.example/mcp --plan-only",
     )
+    onboard.set_defaults(credential=None, start=False, flow=None)
+    onboard.add_argument("mcp", metavar="URL", help="the MCP server's address")
     onboard.add_argument(
-        "--credential",
-        dest="credential_name",
-        metavar="C",
-        help="the name of the credential it creates (default: --name)",
-    )
-    onboard.add_argument(
-        "--route", metavar="R", help="the name of the route it creates (default: --name)"
-    )
-    onboard.add_argument(
-        "--server", metavar="S", help="the name of the gateway server it creates (default: --name)"
-    )
-    onboard.add_argument(
-        "--issuer",
-        metavar="ISSUER",
-        help="the authorization server to use; needed with --client-secret",
-    )
-    onboard.add_argument(
-        "--scope", metavar='"TOKEN ..."', help="the scopes to request, instead of the server's"
-    )
-    onboard.add_argument("--client-name", metavar="TEXT", help="the client's name at the provider")
-    onboard.add_argument(
-        "--client-id", metavar="ID", help="a client registered at the provider already"
-    )
-    onboard.add_argument(
-        "--client-secret",
-        action=_NoValue,
-        help="the client has a secret: read from a hidden prompt, or with --yes from stdin, "
-        "never from the command line",
-    )
-    onboard.add_argument(
-        "--client-auth",
-        choices=("basic", "post"),
-        help="how the client sends its secret (default basic)",
-    )
-    onboard.add_argument(
-        "--redirect-uri", metavar="URL", help="the redirect address the provider has on record"
-    )
-    onboard.add_argument(
-        "--callback-origin",
-        metavar="ORIGIN",
-        help="register the client with this admin.origins portal's callback, not the paste one",
-    )
-    onboard.add_argument(
-        "--allow-private",
+        "--rebind",
         action="store_true",
-        help="the server is on your network: its own host:port may resolve privately",
+        help="when it connects: accept a binding the policy has changed",
     )
-    onboard.add_argument(
-        "--plan-only", action="store_true", help="show the plan, then stop; nothing is stored"
-    )
-    onboard.add_argument(
-        "--yes", action="store_true", help="don't ask; needed when a client secret is piped in"
-    )
-    onboard.add_argument(
-        "--reregister",
-        action="store_true",
-        help="register a new client for the committed credential, under its names",
-    )
-    onboard.add_argument(
-        "--no-connect",
-        action="store_true",
-        help="after the commit: compare only, don't sign in (an adopted grant)",
-    )
-    onboard.add_argument(
-        "--squid-src",
-        action="append",
-        default=[],
-        metavar="vault=ACL",
-        help="the Squid src ACL for the vault in the lines a proxy refusal prints",
-    )
-    layout = onboard.add_mutually_exclusive_group()
-    layout.add_argument(
-        "--indent",
-        type=int,
-        metavar="N",
-        help=f"indent fragment 1's lines N spaces (0 to {policy_emit.INDENT_MAX})",
-    )
-    layout.add_argument(
-        "--for",
-        dest="target",
-        choices=("compose",),
-        help="fragment 1 in the compose form, indented 8 with every $ written $$",
-    )
-    onboard.add_argument("--format", choices=("text", "json"), help=FORMAT_HELP)
+    _onboarding_options(onboard, hidden=False)
 
     oauth = command(
         "oauth",
         "The OAuth credentials' state, and a reset after a failure (in the vault's container).\n"
         "Never a token or a secret.",
+        "With no action, status (the default).\n\n"
+        "Examples:\n"
+        "  zoeymcp oauth\n"
+        "  zoeymcp oauth reset calendar",
     )
-    oauth_commands = oauth.add_subparsers(dest="action", required=True, metavar="action")
+    oauth.set_defaults(credential=None)
+    socket_option(oauth)
+    oauth_commands = oauth.add_subparsers(dest="action", metavar="action")
     oauth_status = oauth_commands.add_parser(
         "status",
-        help="state, failures and warnings of each oauth2 credential (never values)",
+        help="state, failures and warnings of each oauth2 credential, never values (the default)",
         description="The state, failures and warnings of each oauth2 credential; never a value.",
     )
     oauth_status.add_argument("credential", nargs="?", help="only this credential")
@@ -1148,24 +1352,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "policy",
         "A managed policy's revisions, changed as the host (in the vault's container). With no\n"
         "action, the mode and the head. A write prints its plan and asks first, unless --yes.",
-        "Over the vault's admin socket, or with --state DIR on its state directory with the vault\n"
-        "stopped (as the vault's uid, with ZOEYMCP_MASTER_KEY).\n\n"
+        "Over the vault's admin socket, or offline with --state DIR on its state directory, with\n"
+        "the vault stopped (as the vault's uid, with ZOEYMCP_MASTER_KEY).\n\n"
         "Examples:\n"
         "  zoeymcp policy history\n"
         "  zoeymcp policy export > policy.yaml\n"
         "  zoeymcp policy import - < policy.yaml",
     )
-    policy.set_defaults(action=None, format="text", socket=None, state=None)
+    policy.set_defaults(action=None, state=None)
+    format_option(policy)
+    socket_option(policy)
     policy_commands = policy.add_subparsers(dest="action", metavar="action")
 
-    def policy_reader(parser: argparse.ArgumentParser, *, offline: bool = True) -> None:
-        parser.add_argument("--socket", metavar="PATH", help=VAULT_SOCKET_HELP)
-        if offline:
-            parser.add_argument(
-                "--state",
-                metavar="DIR",
-                help="offline: the vault's state directory, with the vault stopped",
-            )
+    def policy_reader(parser: argparse.ArgumentParser) -> None:
+        socket_option(parser, under=True)
+        parser.add_argument("--state", metavar="DIR", help=STATE_HELP)
 
     policy_head = policy_commands.add_parser(
         "head",
@@ -1173,8 +1374,8 @@ def _build_parser() -> argparse.ArgumentParser:
         description="The mode and, in managed mode, the head: when, how and by whom it was "
         "written, its deployment, and the revision the gateway runs.",
     )
-    policy_head.add_argument("--format", choices=("text", "json"), default="text", help=FORMAT_HELP)
-    policy_reader(policy_head, offline=False)
+    format_option(policy_head, under=True)
+    policy_reader(policy_head)
     policy_history = policy_commands.add_parser(
         "history",
         help="the kept revisions, newest first",
@@ -1185,9 +1386,7 @@ def _build_parser() -> argparse.ArgumentParser:
     policy_history.add_argument(
         "--limit", type=int, metavar="N", help="at most N revisions (1 to 50, 50 by default)"
     )
-    policy_history.add_argument(
-        "--format", choices=("text", "json"), default="text", help=FORMAT_HELP
-    )
+    format_option(policy_history, under=True)
     policy_reader(policy_history)
     policy_diff = policy_commands.add_parser(
         "diff",
@@ -1197,7 +1396,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     policy_diff.add_argument("revision", type=int, metavar="N", help="the revision to show")
     policy_diff.add_argument("--against", type=int, metavar="M", help="another kept revision")
-    policy_diff.add_argument("--format", choices=("text", "json"), default="text", help=FORMAT_HELP)
+    format_option(policy_diff, under=True)
     policy_reader(policy_diff)
     policy_export = policy_commands.add_parser(
         "export",
@@ -1229,13 +1428,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="seed revision 1 on a state volume used before, from the policy given",
         description=(
             "Seed revision 1 of a managed policy on a state volume a vault used before, which "
-            "the vault won't seed by itself: from --config, or ZOEYMCP_CONFIG."
+            "the vault won't seed by itself: from FILE (or --config FILE), or ZOEYMCP_CONFIG."
         ),
     )
     policy_seed.add_argument(
-        "--state", metavar="DIR", required=True, help="the vault's state directory"
+        "source", nargs="?", metavar="FILE", help="policy file, or - for stdin"
     )
-    policy_seed.add_argument("--config", metavar="FILE", help="policy file, or - for stdin")
+    policy_seed.add_argument("--state", metavar="DIR", required=True, help=STATE_HELP)
+    policy_seed.add_argument(
+        "--config", metavar="FILE", help="the same as FILE, as check and selftest take it"
+    )
     policy_seed.add_argument("--yes", action="store_true", help="write it without asking")
 
     def policy_writer(parser: argparse.ArgumentParser) -> None:
@@ -1347,17 +1549,9 @@ def _build_parser() -> argparse.ArgumentParser:
     policy_reader(policy_acknowledge)
 
     for sub in [*secret_commands.choices.values(), *oauth_commands.choices.values()]:
-        sub.add_argument("--socket", metavar="PATH", help=VAULT_SOCKET_HELP)
-    for name in (
-        "setup-code",
-        "passkeys",
-        "sessions",
-        "gateway-key",
-        "egress-key",
-        "login",
-        "health",
-    ):
-        commands.choices[name].add_argument("--socket", metavar="PATH", help=VAULT_SOCKET_HELP)
+        socket_option(sub, under=True)
+    for name in ("setup-code", "gateway-key", "egress-key", "login", "onboard", "health"):
+        socket_option(commands.choices[name])
     return parser
 
 
@@ -1539,22 +1733,44 @@ def _cmd_admin(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
                 f"Stored {result['name']}, bound to "
                 f"{admin_client.describe_binding(result['binding'])}.\n"
             )
-        elif args.action == "list":
+        elif args.action in (None, "list"):
             entries = admin_client.secret_list(socket)["secrets"]
             if not entries:
-                err.write(f"{NO_SECRETS}\n")
+                zoeymcp = admin_client.Prefix.for_role("vault").line("zoeymcp", "exec")
+                err.write(NO_SECRETS.format(zoeymcp=zoeymcp) + "\n")
             for entry in entries:
                 out.write(
                     f"{entry['name']}  updated {entry['updated']}  "
                     f"{admin_client.describe_binding(entry['binding'])}\n"
                 )
         elif args.action == "delete":
+            if not _delete_confirmed(socket, args, stdin, err):
+                return EXIT_FINDINGS
             admin_client.secret_delete(socket, args.name)
             out.write(f"Deleted {args.name}.\n")
     except admin_client.AdminUnavailable as exc:
         err.write(f"zoeymcp {args.command}: {exc}\n")
         return admin_client.exit_code(exc)
     return EXIT_OK
+
+
+def _delete_confirmed(socket: str, args: argparse.Namespace, stdin: TextIO, err: TextIO) -> bool:
+    """``secret delete`` of a secret the policy uses asks first, at a terminal (D9): what
+    needs it fails until it is stored again. One it doesn't use, or isn't stored, goes ahead."""
+    if args.yes:
+        return True
+    entries = admin_client.secret_list(socket)["secrets"]
+    entry = next((entry for entry in entries if entry["name"] == args.name), None)
+    # An older vault's list says nothing of use: asked about, as if the policy used it.
+    if entry is None or not entry.get("used", True):
+        return True
+    return admin_client.confirmed(
+        f"The policy uses {args.name}: what needs it fails until it is stored again. Delete it?",
+        yes=False,
+        stdin=stdin,
+        err=err,
+        nothing="Nothing deleted",
+    )
 
 
 def _gateway_key(socket: str, retire_previous: bool, out: TextIO, err: TextIO) -> None:
@@ -1608,7 +1824,8 @@ def _cmd_setup_code(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         result = admin_client.setup_code(socket, reset=args.reset)
         out.write(f"{result['code']}\n")
         out.flush()
-        err.write("".join(f"{line}\n" for line in setup_code_lines(result)))
+        again = admin_client.on_host("setup-code", "--reset")
+        err.write("".join(f"{line}\n" for line in setup_code_lines(result, again)))
         if args.wait:
             return _wait_for_enrolment(socket, result, out, err)
     except admin_client.AdminUnavailable as exc:
@@ -1657,7 +1874,9 @@ def _offline_setup_code(state: Path, reset: bool, out: TextIO, err: TextIO) -> i
         "passkeys": _passkey_count(state, keys, previous),
         "origins": None,
     }
-    err.write("".join(f"{line}\n" for line in setup_code_lines(result)))
+    # Offline, the same command again, where it ran: the vault is stopped.
+    again = shlex.join(["zoeymcp", "setup-code", "--reset", "--state", str(state)])
+    err.write("".join(f"{line}\n" for line in setup_code_lines(result, again)))
     return EXIT_OK
 
 
@@ -1679,10 +1898,11 @@ def _passkey_count(state: Path, keys: Any, previous: Any) -> int | None:
     return len(document.credentials)
 
 
-def setup_code_lines(result: dict[str, Any]) -> list[str]:
+def setup_code_lines(result: dict[str, Any], again: str) -> list[str]:
     """What ``setup-code`` tells the operator on stderr: where to use the code, what enrolling
     with it does, and what a refusal of an unused code means (E.1, E.4). ``origins`` is None
-    when the code was written offline, without the policy."""
+    when the code was written offline, without the policy. ``again`` is the command that issues
+    a code with ``--reset``, as typed where it runs."""
     from ..portal.setupcode import TTL
 
     origins = result["origins"]
@@ -1702,15 +1922,14 @@ def setup_code_lines(result: dict[str, Any]) -> list[str]:
     elif count is None:
         lines.append(
             "The passkey file can't be verified: only a code issued with --reset can enrol; "
-            "run zoeymcp setup-code --reset."
+            f"run: {again}"
         )
     elif count:
         enrolled = "1 passkey is enrolled" if count == 1 else f"{count} passkeys are enrolled"
         effect = "removes all of them and ends every session" if reset else "adds one"
         lines.append(f"{enrolled}; enrolling with this code {effect}.")
     lines.append(
-        "If the portal refuses this code before you have used it, someone else has: run "
-        "zoeymcp setup-code --reset."
+        f"If the portal refuses this code before you have used it, someone else has; run: {again}"
     )
     return lines
 
@@ -1780,10 +1999,15 @@ def passkey_lines(passkey: dict[str, Any]) -> list[str]:
     ]
 
 
-def _cmd_passkeys(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+def _cmd_passkeys(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    """``passkeys [list]``, and ``passkeys remove FINGERPRINT`` (or ``--remove``, D14), which
+    asks first at a terminal (D9)."""
     socket = admin_client.socket_path(args.socket)
+    zoeymcp = admin_client.Prefix.for_role("vault").line("zoeymcp", "exec")
     try:
         if args.remove is not None:
+            if not _remove_confirmed(socket, args.remove, args.yes, stdin, err):
+                return EXIT_FINDINGS
             result = admin_client.passkey_remove(socket, args.remove)
             lines = passkey_lines(result["removed"])
             out.write(f"Removed {lines[0]}\n{lines[1]}\n")
@@ -1792,7 +2016,8 @@ def _cmd_passkeys(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
             out.write(f"{ended} ended; {counted(remaining, 'passkey')} left.\n")
             if remaining == 0:
                 err.write(
-                    "No passkey is left: the portal waits for a setup code (zoeymcp setup-code).\n"
+                    "No passkey is left: the portal waits for a setup code. Issue one with: "
+                    f"{zoeymcp} setup-code\n"
                 )
             return EXIT_OK
         listed = admin_client.passkeys(socket)["passkeys"]
@@ -1800,16 +2025,46 @@ def _cmd_passkeys(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         err.write(f"zoeymcp passkeys: {exc}\n")
         return admin_client.exit_code(exc)
     if not listed:
-        err.write(f"{NO_PASSKEYS}\n")
+        err.write(NO_PASSKEYS.format(zoeymcp=zoeymcp) + "\n")
     for passkey in listed:
         out.write("".join(f"{line}\n" for line in passkey_lines(passkey)))
     return EXIT_OK
 
 
-def _cmd_sessions(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+# Removing the last passkey leaves the portal waiting for a setup code (E.2): said before asking.
+LAST_PASSKEY = "This is the last passkey: with none left, the portal waits for a setup code."
+
+
+def _remove_confirmed(socket: str, fingerprint: str, yes: bool, stdin: TextIO, err: TextIO) -> bool:
+    """``passkeys remove`` asks first, at a terminal (D9), showing the passkey and, for the last
+    one, that the portal then waits for a setup code. One the vault doesn't list goes ahead, for
+    the vault to refuse."""
+    if yes:
+        return True
+    listed = admin_client.passkeys(socket)["passkeys"]
+    found = next((key for key in listed if key["fingerprint"] == fingerprint), None)
+    if found is None:
+        return True
+    review_view.write_lines(passkey_lines(found), err)
+    if len(listed) == 1:
+        err.write(f"{LAST_PASSKEY}\n")
+    return admin_client.confirmed(
+        "Remove it and end its sessions?",
+        yes=False,
+        stdin=stdin,
+        err=err,
+        nothing="Nothing removed",
+    )
+
+
+def _cmd_sessions(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
+    """``sessions [list]``, and ``sessions end`` (or ``--end-all``, D14), which asks first at a
+    terminal (D9)."""
     socket = admin_client.socket_path(args.socket)
     try:
-        if args.end_all:
+        if args.end_all or args.action == "end":
+            if not _end_confirmed(socket, args.yes, stdin, err):
+                return EXIT_FINDINGS
             answer = admin_client.sessions_end_all(socket)
             if args.format == "json":
                 review_view.write_json(answer, out)
@@ -1828,6 +2083,23 @@ def _cmd_sessions(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         err.write("No portal sessions.\n")
     review_view.write_lines([session_line(session) for session in listed], out)
     return EXIT_OK
+
+
+def _end_confirmed(socket: str, yes: bool, stdin: TextIO, err: TextIO) -> bool:
+    """``sessions end`` asks first at a terminal (D9), saying how many it ends; with none to end,
+    it goes ahead."""
+    if yes:
+        return True
+    count = len(admin_client.sessions(socket)["sessions"])
+    if count == 0:
+        return True
+    return admin_client.confirmed(
+        f"End {counted(count, 'portal session')}, including any you are signed in with?",
+        yes=False,
+        stdin=stdin,
+        err=err,
+        nothing="Nothing ended",
+    )
 
 
 def session_line(session: Mapping[str, Any]) -> str:
@@ -2168,37 +2440,30 @@ def _cmd_gateway_status(args: argparse.Namespace, out: TextIO, err: TextIO) -> i
 
 
 def _cmd_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
-    if args.vault:
+    """``ledger [list|verify|check|vault]``, and the flag forms before the actions (D14):
+    ``--verify`` and ``--vault``."""
+    if args.vault or args.action == "vault":
         return _cmd_vault_ledger(args, stdin, out, err)
     if args.restart_chain or args.before is not None or args.chain is not None:
-        err.write("zoeymcp ledger: --restart-chain, --before and --chain go with --vault\n")
+        err.write("zoeymcp ledger: --restart-chain, --before and --chain go with ledger vault\n")
         return EXIT_UNREADABLE
     socket = admin_client.gateway_socket_path(args.socket)
-    if args.action not in (None, "check"):
-        err.write("zoeymcp ledger: the only action is 'check REF FILE'\n")
-        return EXIT_UNREADABLE
     try:
         if args.action == "check":
-            if args.ref is None or args.file is None:
-                err.write("zoeymcp ledger: check takes REF FILE\n")
-                return EXIT_UNREADABLE
             try:
                 arguments = json.loads(Path(args.file).read_text(encoding="utf-8"))
             except (OSError, ValueError) as exc:
-                err.write(f"zoeymcp ledger: can't read {args.file}: {exc}\n")
+                err.write(f"zoeymcp ledger check: can't read {args.file}: {exc}\n")
                 return EXIT_UNREADABLE
             result = admin_client.gateway_ledger_check(socket, args.ref, arguments)
-            ledger_view.write(out, ledger_view.check_lines(result))
+            review_view.write_lines(ledger_view.check_lines(result), out)
             return EXIT_OK if result["matches"] else EXIT_FINDINGS
-        if args.ref is not None:
-            err.write("zoeymcp ledger: a REF goes with check\n")
-            return EXIT_UNREADABLE
-        if args.verify:
+        if args.verify or args.action == "verify":
             verified = admin_client.gateway_ledger_verify(socket)
             if args.format == "json":
                 ledger_view.write_json(out, [verified])
             else:
-                ledger_view.write(out, ledger_view.verify_lines(verified))
+                review_view.write_lines(ledger_view.verify_lines(verified), out)
             return EXIT_OK if verified["ok"] else EXIT_FINDINGS
         since = ledger_view.since_ms(args.since)
         records = admin_client.gateway_ledger(
@@ -2214,22 +2479,24 @@ def _cmd_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextI
         kept = [r for r in records if since is None or r["ts"] >= since]
         ledger_view.write_json(out, kept)
     else:
-        ledger_view.write(out, ledger_view.lines(records, since=since))
+        # Escaped like every other listing (D19): the gateway's own records, as text.
+        review_view.write_lines(ledger_view.lines(records, since=since), out)
     return EXIT_OK
 
 
 def _cmd_vault_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
-    """``ledger --vault [--restart-chain] [--before SEQ] [--chain C] [--verify]``: the vault's
-    reported copy, joined with its own approval chain (M8 design K.3), or that chain's walk."""
-    gateway_only = (args.action, args.ref, args.since, args.client, args.server, args.tool)
-    if any(value is not None for value in gateway_only):
+    """``ledger vault [--restart-chain] [--before SEQ] [--chain C] [--verify]`` (or ``ledger
+    --vault ...``): the vault's reported copy, joined with its own approval chain (M8 design
+    K.3), or that chain's walk."""
+    gateway_only = (args.since, args.client, args.server, args.tool)
+    if args.action not in (None, "vault") or any(value is not None for value in gateway_only):
         err.write(
-            "zoeymcp ledger: --vault takes only --restart-chain, --before, --chain, --verify and "
-            "--format\n"
+            "zoeymcp ledger: ledger vault takes only --restart-chain, --before, --chain, --verify "
+            "and --format\n"
         )
         return EXIT_UNREADABLE
     if args.verify and (args.restart_chain or args.before is not None or args.chain is not None):
-        err.write("zoeymcp ledger: --verify with --vault walks the vault chain, alone\n")
+        err.write("zoeymcp ledger: --verify with ledger vault walks the vault chain, alone\n")
         return EXIT_UNREADABLE
     socket = admin_client.socket_path(args.socket)
     try:
@@ -2238,7 +2505,7 @@ def _cmd_vault_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err:
             if args.format == "json":
                 ledger_view.write_json(out, [verified])
             else:
-                ledger_view.write(out, ledger_view.verify_lines(verified))
+                review_view.write_lines(ledger_view.verify_lines(verified), out)
             return EXIT_OK if verified["ok"] else EXIT_FINDINGS
         if args.restart_chain:
             return _restart_chain(socket, stdin, out, err)
@@ -2249,7 +2516,8 @@ def _cmd_vault_ledger(args: argparse.Namespace, stdin: TextIO, out: TextIO, err:
     if args.format == "json":
         review_view.write_json(page, out)
     else:
-        review_view.write_lines(ledger_view.vault_lines(page), out)
+        prefix = admin_client.Prefix.for_role("vault")
+        review_view.write_lines(ledger_view.vault_lines(page, prefix), out)
     state = page["state"]
     return EXIT_OK if state["state"] == "ok" and state["broken_at"] is None else EXIT_FINDINGS
 
@@ -2328,9 +2596,10 @@ def _login(
         _describe_login(credential, started, said)
         minutes = round(FLOW_TTL / 60)
         if start:
+            then = admin_client.on_host("login", credential, f"--flow={started['flow']}")
             out.write(
-                f"\nThen, within {minutes} minutes, run: zoeymcp login {credential} "
-                f"--flow={started['flow']}\nand give it the address your browser was sent to.\n"
+                f"\nThen, within {minutes} minutes, run: {then}\n"
+                "and give it the address your browser was sent to.\n"
             )
             return EXIT_OK
         how = "input hidden" if stdin.isatty() else "one line on stdin"
@@ -2408,7 +2677,8 @@ def _report_login(credential: str, result: dict[str, Any], out: TextIO, err: Tex
         ("refresh_expires_at", "The refresh token expires at"),
     ):
         if result[key] is not None:
-            out.write(f"{text} {result[key]}; run login again before then.\n")
+            again = admin_client.on_host("login", credential)
+            out.write(f"{text} {result[key]}; connect again before then: {again}\n")
     if result["seed_note"] is not None:
         out.write(f"{result['seed_note']}\n")
     if not result["persisted"]:
@@ -2445,7 +2715,7 @@ def _cmd_oauth(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
             return EXIT_OK
         entries = admin_client.oauth_status(socket)["credentials"]
     except admin_client.AdminUnavailable as exc:
-        err.write(f"zoeymcp oauth {args.action}: {exc}\n")
+        err.write(f"zoeymcp oauth {args.action or 'status'}: {exc}\n")
         return admin_client.exit_code(exc)
     if args.credential is not None:
         known = known_names(entry["credential"] for entry in entries)
@@ -2612,16 +2882,26 @@ def _finding_lines(findings: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
-def health_action(action: dict[str, str] | None) -> str | None:
-    """An action in the CLI's words: its own command, or what to do."""
+def health_action(
+    action: dict[str, str] | None, prefix: admin_client.Prefix | None = None
+) -> str | None:
+    """An action in the CLI's words: its own command as typed on the host, in the vault's
+    container (``prefix``, by default this environment's), or what to do."""
     if action is None:
         return None
+    prefix = admin_client.Prefix.for_role("vault") if prefix is None else prefix
     ref = action.get("ref", "")
     fields = {
         "secret": ref.removeprefix("store:"),
         "var": ref.removeprefix("env:"),
         **action,
+        "zoeymcp": prefix.line("zoeymcp", "exec"),
+        "hup": prefix.line("", "hup"),
+        "restart": prefix.line("", "restart"),
+        "up": prefix.line("", "up"),
     }
+    if "command" in action:
+        fields["command"] = prefix.line(action["command"], "exec")
     template = HEALTH_ACTIONS.get(action["kind"])
     # An action this CLI doesn't know (a newer vault's): its kind.
     return action["kind"] if template is None else template.format_map(fields)
@@ -2655,7 +2935,9 @@ def _cmd_selftest(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: Tex
         _report(exc.source, exc.findings, "text", err, readable=exc.readable)
         return EXIT_UNREADABLE
     if policy.mode == "managed":
-        err.write(f"zoeymcp selftest: {NOT_THE_HEAD}\n")
+        words = ["selftest", "--config", "-", "--cases", args.cases]
+        head = not_the_head(words, admin_client.Prefix.from_environ())
+        err.write(f"zoeymcp selftest: {head}\n")
     errors = [f for f in check_policy(policy) if f.level == "error"]
     if errors:
         _report(source, errors, "text", err)
@@ -2719,7 +3001,7 @@ def _cmd_check(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
     emit = args.emit_egress_allowlist
     if not emit and (args.allowlist_format or args.squid_src or args.compare):
         err.write(
-            "zoeymcp check: --allowlist-format, --squid-src and --check go with "
+            "zoeymcp check: --allowlist-format, --squid-src and --compare go with "
             "--emit-egress-allowlist\n"
         )
         return EXIT_UNREADABLE
@@ -2759,12 +3041,16 @@ def _cmd_check(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO
         _report(exc.source, exc.findings, args.format, findings_out, readable=exc.readable)
         return EXIT_FINDINGS if exc.readable else EXIT_UNREADABLE
     if policy.mode == "managed":
-        err.write(f"zoeymcp check: {NOT_THE_HEAD}\n")
+        err.write(f"zoeymcp check: {_check_not_the_head()}\n")
     findings = check_policy(policy, environ=os.environ if args.resolve_env else None)
     _report(source, findings, args.format, findings_out)
     if any(f.level == "error" for f in findings):
         return EXIT_FINDINGS
     return _emit_egress_allowlist(args, policy, out, err) if emit else EXIT_OK
+
+
+def _check_not_the_head() -> str:
+    return not_the_head(["check", "--config", "-"], admin_client.Prefix.from_environ())
 
 
 def _check_with(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextIO) -> int:
@@ -2787,7 +3073,7 @@ def _check_with(args: argparse.Namespace, stdin: TextIO, out: TextIO, err: TextI
         _report(source, [Finding("(document)", "error", str(exc))], args.format, findings_out)
         return EXIT_FINDINGS
     if data.get("mode") == "managed":
-        err.write(f"zoeymcp check: {NOT_THE_HEAD}\n")
+        err.write(f"zoeymcp check: {_check_not_the_head()}\n")
     flags: list[Finding] = []
     added: list[policy_merge.Path] = []
     replaced: list[policy_merge.Path] = []
@@ -3014,16 +3300,16 @@ def main(
     if args.command == "setup-code":
         return _cmd_setup_code(args, out, err)
     if args.command == "passkeys":
-        return _cmd_passkeys(args, out, err)
+        return _cmd_passkeys(args, stdin, out, err)
     if args.command == "sessions":
-        return _cmd_sessions(args, out, err)
+        return _cmd_sessions(args, stdin, out, err)
     if args.command == "review":
         return _cmd_review(args, stdin, out, err)
     if args.command == "gateway-status":
         return _cmd_gateway_status(args, out, err)
     if args.command == "ledger":
         return _cmd_ledger(args, stdin, out, err)
-    if args.command == "login":
+    if args.command in ("login", "onboard"):
         return _cmd_login(args, argv, stdin, out, err)
     if args.command == "oauth":
         return _cmd_oauth(args, out, err)

@@ -1,5 +1,6 @@
-"""``zoeymcp login --mcp URL``: onboarding by URL from the vault's container (M7 design D.10-D.12,
-M.7). The vault does the work over its admin socket; this module asks, prompts and prints.
+"""``zoeymcp onboard URL`` (``login --mcp URL`` is its alias): onboarding by URL from the vault's
+container (M7 design D.10-D.12, M.7). The vault does the work over its admin socket; this module
+asks, prompts and prints.
 
 - **The first run** discovers (``POST /onboard/discover``) and prints the plan on stderr, every
   string from the network through :func:`.review.untrusted`; asks, unless ``--yes``, whether to
@@ -10,7 +11,7 @@ M.7). The vault does the work over its admin socket; this module asks, prompts a
   fragment 1 to stdout and the ``next`` list to stderr.
   ``--plan-only`` stops after the plan, which the next run with the same URL and names resumes.
 - **The second run** (D.12): for a URL the running policy has onboarded, the vault compares what
-  it finds with what is committed, and the CLI signs in with ``login``'s own paste flow, unless
+  it finds with what is committed, and the CLI connects with ``login``'s own paste flow, unless
   ``--no-connect`` or the credential already holds a refresh token (OPS-13). Then, with a token
   to review with, it queues the server's review through the vault's job path (F.2), waits up to
   :data:`REPORT_WAIT` for the gateway's report, prints its counts, and prints what is next:
@@ -36,7 +37,6 @@ import argparse
 import contextlib
 import shlex
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, TextIO
 from urllib.parse import urlsplit
@@ -48,7 +48,9 @@ from ..vault.onboarding import ONBOARDING_TTL, fragment_file, managed_next
 from . import admin_client
 from .admin_client import COMPOSE_CMD_ENV as COMPOSE_CMD_ENV
 from .admin_client import DEFAULT_COMPOSE_CMD as DEFAULT_COMPOSE_CMD
+from .admin_client import DEFAULT_EXEC_SERVICE as DEFAULT_EXEC_SERVICE
 from .admin_client import EXEC_SERVICE_ENV as EXEC_SERVICE_ENV
+from .admin_client import Prefix as Prefix
 from .review import (
     StillRunning,
     counts_line,
@@ -63,8 +65,6 @@ EXIT_OK = 0
 EXIT_FINDINGS = 1
 EXIT_USAGE = 2
 
-# The shipped hardened file's service, when the container's environment names none (M.7).
-DEFAULT_EXEC_SERVICE: Final = "vault"
 # How long the second run waits for the review it queued (M.6).
 REPORT_WAIT: Final = 120
 # The onboarding's flags, which a login of a named credential doesn't take: (dest, flag).
@@ -109,39 +109,6 @@ BODY_KEYS: Final = (
 SQUID_SOURCE: Final = "vault"
 # A sign-in the second run makes: the credential, and where its lines go. Its exit code.
 Connect = Callable[[str, TextIO], int]
-
-
-@dataclass(frozen=True)
-class Prefix:
-    """How a ``next`` command is run from the host (M.7): the compose command and the service this
-    CLI runs in."""
-
-    compose: str = DEFAULT_COMPOSE_CMD
-    service: str = DEFAULT_EXEC_SERVICE
-
-    @classmethod
-    def from_environ(cls, environ: Mapping[str, str]) -> Prefix:
-        return cls(
-            environ.get(COMPOSE_CMD_ENV) or DEFAULT_COMPOSE_CMD,
-            environ.get(EXEC_SERVICE_ENV) or DEFAULT_EXEC_SERVICE,
-        )
-
-    def line(self, command: str, via: str | None, *, piped: bool = False) -> str:
-        """``command`` (already shell-quoted) as typed on the host, by its ``via``: in the
-        running service (``-T`` when stdin is piped), a one-off container (with the working
-        directory at /w), the service recreated or restarted; with no ``via``, as it is."""
-        service = shlex.quote(self.service)
-        if via == "exec":
-            return f"{self.compose} exec{' -T' if piped else ''} {service} {command}"
-        if via == "run":
-            return f"{self.compose} run --rm --no-deps {service} {command}"
-        if via == "run_mount":
-            return f'{self.compose} run --rm --no-deps -v "$PWD:/w:ro" {service} {command}'
-        if via == "up":
-            return f"{self.compose} up -d {service}"
-        if via == "restart":
-            return f"{self.compose} restart {service}"
-        return command
 
 
 def step_lines(step: Mapping[str, Any], prefix: Prefix) -> list[str]:
@@ -240,13 +207,19 @@ def without_mcp(args: argparse.Namespace) -> str | None:
     used = [flag for dest, flag in ONBOARD_FLAGS if getattr(args, dest) not in (None, False, [])]
     if not used:
         return None
-    return f"{', '.join(used)} {'goes' if len(used) == 1 else 'go'} with --mcp"
+    goes = "goes" if len(used) == 1 else "go"
+    return f"{', '.join(used)} {goes} with zoeymcp onboard URL"
+
+
+def command_name(args: argparse.Namespace) -> str:
+    """How the run's lines name it: ``zoeymcp onboard``, or ``zoeymcp login`` for its alias."""
+    return f"zoeymcp {getattr(args, 'command', None) or 'login'}"
 
 
 def usage(
     args: argparse.Namespace, argv: Sequence[str], stdin: TextIO, prefix: Prefix
 ) -> str | None:
-    """What doesn't fit together in a ``login --mcp`` run, or None (D.10)."""
+    """What doesn't fit together in an onboarding run, or None (D.10)."""
     if args.client_secret not in (True, False):
         # Never echoed, and before anything that shows argv (OPS-4).
         return (
@@ -295,19 +268,19 @@ def login_mcp(
     connect: Connect,
     environ: Mapping[str, str],
 ) -> int:
-    """``login --mcp``: exit 0 once fragment 1 is written or the second run is done, 1 when
-    the vault refused, the deployment is managed or the operator declined, 2 for a usage error
-    or a vault that can't be reached."""
+    """``onboard URL`` (or ``login --mcp URL``): exit 0 once fragment 1 is written or the second
+    run is done, 1 when the vault refused, the deployment is managed or the operator declined, 2
+    for a usage error or a vault that can't be reached."""
     prefix = Prefix.from_environ(environ)
     problem = usage(args, argv, stdin, prefix)
     if problem is not None:
-        err.write(f"zoeymcp login: {problem}\n")
+        err.write(f"{command_name(args)}: {problem}\n")
         return EXIT_USAGE
     return _Run(args, argv, stdin, out, err, prefix, connect).start()
 
 
 class _Run:
-    """One ``login --mcp`` run and the answers it collected, for ``--format json``."""
+    """One onboarding run and the answers it collected, for ``--format json``."""
 
     def __init__(
         self,
@@ -328,6 +301,7 @@ class _Run:
         self.connect = connect
         self.socket = admin_client.socket_path(args.socket)
         self.json = args.format == "json"
+        self.name = command_name(args)
         self.answers: dict[str, Any] = {}
 
     def say(self, *lines: str) -> None:
@@ -350,7 +324,7 @@ class _Run:
             steps = managed_steps(mode)
             self.answers["refused"] = {"error": reason, "mode": mode, "next": steps}
             if not self.json:
-                self.say(f"zoeymcp login: {reason}", *next_lines(steps, self.prefix))
+                self.say(f"{self.name}: {reason}", *next_lines(steps, self.prefix))
             return self.finish(EXIT_FINDINGS)
         try:
             plan = admin_client.onboard_discover(self.socket, discover_body(self.args))
@@ -382,14 +356,14 @@ class _Run:
         if plan["stage"] != "registered":
             if not self.confirmed(plan):
                 self.cancel(onboarding)
-                self.say("zoeymcp login: nothing was registered or stored")
+                self.say(f"{self.name}: nothing was registered or stored")
                 return self.finish(EXIT_FINDINGS)
             if self.args.client_secret:
                 try:
                     secret = admin_client.read_secret_value(self.stdin)
                 except admin_client.AdminUnavailable as exc:
                     self.cancel(onboarding)
-                    self.say(f"zoeymcp login: {exc}")
+                    self.say(f"{self.name}: {exc}")
                     return self.finish(admin_client.exit_code(exc))
         indent: int | str = "compose" if self.args.target == "compose" else self.args.indent or 0
         registers = plan["stage"] != "registered" and plan["plan"].get("registration") == "dcr"
@@ -473,11 +447,12 @@ class _Run:
         if held != "none":
             self.say(
                 f"{untrusted(credential)} already holds a refresh token ({held}), so this run "
-                f"doesn't sign in again; zoeymcp login {untrusted(credential)} does."
+                f"doesn't connect again; {untrusted(self.prefix.zoeymcp('login', credential))} "
+                "does."
             )
         elif self.args.no_connect:
             # Nothing to review with until a sign-in or a seed: the review would only fail.
-            self.say("Not signing in (--no-connect).", *next_lines(steps, self.prefix))
+            self.say("Not connecting (--no-connect).", *next_lines(steps, self.prefix))
             return self.finish(EXIT_OK)
         else:
             self.say("Connecting:")
@@ -531,7 +506,7 @@ class _Run:
         if self.json:
             self.answers["refused"] = {**data, "next": steps} if steps else data
             return self.finish(code)
-        lines = [f"zoeymcp login: {untrusted(exc)}"]
+        lines = [f"{self.name}: {untrusted(exc)}"]
         reason = data.get("reason")
         if reason == "bad_body" and data.get("detail"):
             lines.append(f"  {untrusted(data['detail'])}")

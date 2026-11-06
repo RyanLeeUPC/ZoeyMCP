@@ -743,11 +743,11 @@ def test_ledger_chain_from_the_cli(
     assert run_cli(["ledger", "--chain", "vault"]) == (
         2,
         "",
-        "zoeymcp ledger: --restart-chain, --before and --chain go with --vault\n",
+        "zoeymcp ledger: --restart-chain, --before and --chain go with ledger vault\n",
     )
     assert run_cli(["ledger", "--vault", "--verify", "--chain", "vault"]) == (
         2,
         "",
-        "zoeymcp ledger: --verify with --vault walks the vault chain, alone\n",
+        "zoeymcp ledger: --verify with ledger vault walks the vault chain, alone\n",
     )
     portal.call(rig.token_client.aclose)

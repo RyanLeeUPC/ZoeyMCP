@@ -31,7 +31,16 @@ The examples below shorten that to `zoeymcp ...`. `docker compose exec` gives th
 terminal, which the hidden prompts need. Add `-T` to pipe a value in instead. Run on the host, or
 in the wrong container, a command says it can't reach the admin socket, and prints the `exec`
 form that runs it in the right one. `zoeymcp --help` lists the commands by when you need them
-and says where each runs.
+and says where each runs. What the CLI prints is never shortened: every command it names as the
+way on (a health action, the next page of a list, a reload) is written out as you type it on the
+host, after the compose command `ZOEYMCP_COMPOSE_CMD` names and the service, as its `Next:` lists
+are; a reload is `docker compose ... kill -s HUP <service>` (§7).
+
+A command with actions has a default: `zoeymcp secret` lists, `oauth` shows the status,
+`passkeys`, `sessions`, `ledger` and `approvals` list, and `policy` shows the head. Its
+`--format` and `--socket` go before or after the action (`zoeymcp approvals --format json`). The
+flag forms from before the actions still work: `passkeys --remove FINGERPRINT`, `sessions
+--end-all`, `ledger --verify`, `ledger --vault ...`, `check --check FILE` and `login --mcp URL`.
 
 ## Exit codes
 
@@ -46,6 +55,12 @@ Every command exits with one of three codes, so a script can tell them apart:
 A command's own help names what its 1 means (`health`: an error, or with `--strict` a warning;
 `review`: something needs you). The answer goes to stdout and everything else to stderr: the
 plan, the prompts, the notes and the errors.
+
+A command that removes what you can't get back asks first, `[y/N]`, as a policy write does:
+`passkeys remove` (saying so when it is the last passkey, after which the portal waits for a
+setup code), `sessions end`, and `secret delete` of a secret the running policy uses. Give
+`--yes` in a script. Without it, off a terminal, there is no answer to read: nothing is done, the
+command names `--yes` and exits 1.
 
 ## 1. The state volume
 
@@ -84,9 +99,9 @@ code is never logged; `setup_code_issued` records only its expiry and `reset`.
 
 `zoeymcp passkeys` lists every passkey with its fingerprint, how and where it was enrolled
 (`via` is `setup_code`, `setup_code_reset` or `portal`) and when it was last used;
-`zoeymcp passkeys --remove FINGERPRINT` removes one, the last one too. `zoeymcp sessions` lists
-the portal's sessions and `--end-all` ends them. None of these need a passkey: host access is the
-recovery path.
+`zoeymcp passkeys remove FINGERPRINT` removes one, the last one too, after asking.
+`zoeymcp sessions` lists the portal's sessions and `zoeymcp sessions end` ends them. None of these
+need a passkey: host access is the recovery path.
 
 On a host without the admin socket (Windows, or `--admin-socket none`),
 `zoeymcp setup-code --state DIR [--reset]` writes the code into the state directory itself. It
@@ -112,7 +127,7 @@ managed mode the anchor catches a `/state/policy` restored on its own; the whole
 from one backup brings back the policy of its day, as every other file here.) Besides
 the passkeys above, a restored `store.json` holds the client secrets of its day. A client the
 vault registered since the backup is gone from the store, but stays registered at the provider
-(remove it in the provider's own console), and its credential needs a new one (`login --mcp URL
+(remove it in the provider's own console), and its credential needs a new one (`onboard URL
 --reregister`, §11); a client re-registered since is back to its old secret, which the provider
 may no longer take (`oauth_client_rejected`, §4): register again the same way. A rotating refresh
 token that rotated since the backup is spent: sign in again (§6).
@@ -145,7 +160,8 @@ other way, give it the same time (`docker stop -t 50`).
 
 ## 2. Logging in
 
-`zoeymcp login <credential>` consents to an OAuth credential and stores its refresh token. It
+`zoeymcp login <credential>` connects an OAuth credential, as the portal's **Connect** does: you
+approve at the provider, and the vault stores the refresh token. It
 needs the credential's `authorize_url`, a route that uses the credential, and, for a
 confidential client, the client secret stored first (`zoeymcp secret set <name>`). Register the
 credential's `redirect_uri` with the provider exactly as written; the default is
@@ -166,7 +182,7 @@ expected. Copy the full address from the address bar and paste it here (input hi
 >
 Stored the refresh token for spotify as spotify-refresh.
 Granted: user-read-currently-playing user-top-read
-The grant ends at 2027-04-15T09:00:00Z; run login again before then.
+The grant ends at 2027-04-15T09:00:00Z; connect again before then: docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp login spotify
 ```
 
 - Open the URL in any browser, on any machine: the redirect goes to the browser's own machine and
@@ -326,11 +342,11 @@ $ zoeymcp health
 notes (header): ok
 calendar (oauth2): warning
   warning idle: unused for 171 days; the provider drops unused grants after 180 (from stored metadata)
-          run: zoeymcp login calendar
+          run: docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp login calendar
 connector mail: ok (3 of 20 sends in 24 h)
 store: info (4 entries)
   info    unreferenced: nothing in the policy uses store:old-key
-          run: zoeymcp secret delete old-key
+          run: docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp secret delete old-key
 health: ok (0 errors, 1 warning, 1 info)
 ```
 
@@ -339,7 +355,7 @@ can't be asked. `--format json` (or `--json`) prints the whole report, with a `s
 per level and each finding's `code`, `level`, `advisory`, `text` and `action` (a `kind` such as `connect`, `reset`,
 `set_secret`, `restart`, `delete_secret`, `fix_policy`, `wait`, `check_volume`,
 `check_mailbox`, `check_gateway`, `read_ledger`, `add_passkey`, `review_passkeys`,
-`reset_passkeys`, `onboard_again` (with the `command`, `login --mcp URL --reregister`),
+`reset_passkeys`, `onboard_again` (with the `command`, `onboard URL --reregister`),
 `widen_scope` (with the `scope` and the `fragment` that sets it), `check_egress_role` or `review`
 (with the `server`: `zoeymcp review <server>`), and the name it applies to). For a deployment's
 verify script:
@@ -364,8 +380,8 @@ There is no unauthenticated health endpoint: health is the admin socket's `GET /
 | `terminal`, `backoff` | error, warning | as `oauth status` shows them, with the hint's action |
 | `reconsent_due`, `unexpected_scopes`, `missing_scopes` | warning | as `oauth status` shows them |
 | `insufficient_scope` | warning | an upstream said the token lacks a scope, **since the vault started**: a restart forgets it. When its challenge named a `scope`, the text lists it, and if that adds to the credential's own the action is `widen_scope`: merge the fragment (`--json` holds it; it sets `credentials.<c>.scope` to the union and keeps the rest), check and reload, then `zoeymcp login <c>`. The vault never widens a scope itself |
-| `client_secret_expiring`, `client_secret_expired` | warning, error | a client the vault registered has a `client_secret_expires_at` (from stored metadata) within 14 days, or past: register a new client with `login --mcp URL --reregister` (the action's command), or for a credential without the server's URL as its `resource`, enter the new secret with `secret set`. The wall clock judges it |
-| `resource_metadata_changed` | warning | a 401 on the credential's route named other protected-resource metadata than its `resource_metadata`, **since the vault started**: the server may have moved its authorization. Onboard again (`login --mcp URL --reregister`); the vault never registers again by itself |
+| `client_secret_expiring`, `client_secret_expired` | warning, error | a client the vault registered has a `client_secret_expires_at` (from stored metadata) within 14 days, or past: register a new client with `onboard URL --reregister` (the action's command), or for a credential without the server's URL as its `resource`, enter the new secret with `secret set`. The wall clock judges it |
+| `resource_metadata_changed` | warning | a 401 on the credential's route named other protected-resource metadata than its `resource_metadata`, **since the vault started**: the server may have moved its authorization. Onboard again (`onboard URL --reregister`); the vault never registers again by itself |
 | `address_refused` | error | the vault refused to connect to the credential's token endpoint, its revocation endpoint or a route's upstream **since the vault started**, because the name resolved to a private, loopback or otherwise non-global address (§7's upgrade note): list its `host:port` in `egress_private` if it is meant to be private, and reload. A reload that lists it, or moves the endpoint, ends the finding. A route with no credential has no credential section: its refusal is the `egress` section's, with the route's name (`fix_policy`). The log has each refusal too (`address_refused`, §11) |
 | `egress_allowlist_stale` | warning | the egress role (§31) hasn't fetched its allowlists for more than 300 s: its lists are stale, so it refuses every new tunnel. A role whose key the vault refuses (a wrong key, or the old one after a generation bump) counts from its first request. With `egress_proxy_kind: role` the role is expected, so one that hasn't asked since the vault started counts from the vault's start. Check that it runs, reaches the vault, and has the key `zoeymcp egress-key` prints (`check_egress_role`). In the `egress` section; with your own proxy or none, a vault no role has asked since it started has no such finding |
 | `program_unconfined` | info | (standard tier) a route has a `program` block, a `unix:` upstream, or is a bridge's route to a loopback address (a literal, `localhost` or a name under it): nothing in the standard tier confines that program, which can reach every listener in the container, the host's network and the internet (§32). In the `egress` section, naming the route; nothing to do but know it, or move the program to the hardened tier |
@@ -509,8 +525,8 @@ there must be one holder at a time, or a rotating token is used twice and the pr
 the whole grant. In order: commit the credential with that tool's client ID (onboarded with `login
 --mcp URL --client-id ID`, §11, or written by hand); stop the old holder's refreshes; seed the
 token, `printf '%s' "$RT" | zoeymcp secret set <credential>-refresh` (or an `env:` seed); and only
-then let the vault refresh it. `login --mcp URL --no-connect` then compares the committed
-credential with the server's metadata without signing in, and a second run never signs in over a
+then let the vault refresh it. `onboard URL --no-connect` then compares the committed
+credential with the server's metadata without connecting, and a second run never connects over a
 token the credential already holds.
 
 ## 6. Recovery per kind
@@ -525,15 +541,15 @@ page) or **Connect** (Credentials page) does the same (§26).
 | OAuth env seed, not rotating | automatic: the seed is promoted again | — |
 | OAuth env seed, rotating | `zoeymcp login` | `zoeymcp login` |
 | `client_credentials` | `secret set` the client secret | — |
-| a client secret you gave `login --mcp` (`<credential>-client-secret`) | `secret set` it again, then `zoeymcp login` | — |
-| a client the vault registered (`<credential>-client-secret`, or none for a public client) | `login --mcp URL --reregister` (§11), commit the fragment, then `zoeymcp login`; remove the old client in the provider's own console | — |
+| a client secret you gave `onboard` (`<credential>-client-secret`) | `secret set` it again, then `zoeymcp login` | — |
+| a client the vault registered (`<credential>-client-secret`, or none for a public client) | `onboard URL --reregister` (§11), commit the fragment, then `zoeymcp login`; remove the old client in the provider's own console | — |
 | SMTP connector | a new app password at the provider, then `secret set` it; after a change of recipient, host, port or From, `secret set` again (the old binding no longer matches) | — |
 
 The portal's own state recovers from the host, never from the portal:
 
 | What happened | Recovery |
 | --- | --- |
-| one passkey lost, another still works | sign in with the other and remove the lost one (or `zoeymcp passkeys --remove FINGERPRINT`) |
+| one passkey lost, another still works | sign in with the other and remove the lost one (or `zoeymcp passkeys remove FINGERPRINT`) |
 | every passkey lost | `zoeymcp setup-code` adds one; `--reset` replaces them all |
 | a passkey or its device may be stolen | `zoeymcp setup-code --reset`: its enrolment removes every other passkey and ends every session |
 | the passkey file can't be verified (`passkey_store_tampered`, `passkeys_unavailable`) | `zoeymcp setup-code --reset`: the file is moved aside as `portal/passkeys.rejected-<ms>.json`, never overwritten |
@@ -804,7 +820,7 @@ apply: add the route, the credential and the server, and choose the server's too
 which saves each change, or export the policy, edit it and import it on the host (§34, "Importing
 a change"). The CLI knows which mode runs and prints no fragment for a managed deployment: `review`
 with `--add`, `--allow`, `--approve`, `--allow-read-only`, `--repin`, `--decline`,
-`--decline-rest` or `--choices`, and `login --mcp`, refuse (exit 1) and name the way instead:
+`--decline-rest` or `--choices`, and `onboard`, refuse (exit 1) and name the way instead:
 
 ```text
 $ zoeymcp review notes --add search_notes
@@ -817,7 +833,7 @@ Next:
     zoeymcp policy import - < policy.yaml
 ```
 
-Through the vault's socket (`--via vault`, and `login --mcp`) the CLI asks the vault's mode
+Through the vault's socket (`--via vault`, and `onboard`) the CLI asks the vault's mode
 (`GET /policy`) before anything else, and the commands it names carry the compose prefix. In the
 gateway's container, which has no vault socket, the gateway's answer names the mode: the vault
 states it beside every view it serves (the `x-zoeymcp-policy-mode` header, outside the view and
@@ -833,8 +849,10 @@ file alone, and a clear that goes through has no next step. The JSON of a review
 
 `check` (with `--with` or `--emit-egress-allowlist` too) and `selftest` run in a throwaway
 container with no socket, so they read the document you give them, never the running revision.
-Given a managed document, they say so on stderr: "checking this document, not the running
-revision: to check what runs, pipe zoeymcp policy export into this command with --config -":
+Given a managed document, they say so on stderr, and print the pipe that checks the running
+revision instead, as below: "checking this document, not the running revision: to check what
+runs, pipe the export into it: ... exec -T vault zoeymcp policy export | ... run --rm --no-deps -T
+vault check --config -":
 
 ```sh
 # hardened tier
@@ -866,8 +884,8 @@ passkey prompts, each for a different thing (§26, "MCP servers"):
    client agent1's token can call notes's 12 included tools".
 
 Adding a client, changing its token, or the server's route or credential once saved are host
-imports (§34). The CLI's `login --mcp` refuses in managed mode (above), so this walk is the
-portal's; `zoeymcp login <credential>` still signs in from the host.
+imports (§34). The CLI's `onboard` refuses in managed mode (above), so this walk is the
+portal's; `zoeymcp login <credential>` still connects from the host.
 
 The rest of this section is declarative mode.
 
@@ -1056,10 +1074,11 @@ allow    list_notes   sha256:6c1e...   # read-only (the server's suggestion)
 
 ### Onboarding by URL
 
-`zoeymcp login --mcp URL` (M7) adds an OAuth-protected MCP server from its URL, beside the manual
+`zoeymcp onboard URL` (M7) adds an OAuth-protected MCP server from its URL, beside the manual
 path above. It takes two commits: fragment 1 adds the credential, its route and the server with
-no tools; once it is committed, the same command again signs in and queues the review (steps 5
-to 7 above), which gives the tools to commit. Without `--client-id`, the vault registers a client itself
+no tools; once it is committed, the same command again connects the credential and queues the
+review (steps 5 to 7 above), which gives the tools to commit. `zoeymcp login --mcp URL` is the
+same command under its older name, with the same options. Without `--client-id`, the vault registers a client itself
 (dynamic client registration, RFC 7591) when the authorization server offers it; with one, it
 uses the client the provider registered for you. A server that offers neither stops the plan at
 `registration_unavailable` (or `cimd_only`, for one that registers clients by metadata document
@@ -1131,7 +1150,7 @@ host.
     --mcp https://mcp.notes.example/mcp --name notes --issuer https://auth.notes.example \
     --client-id existing-client --plan-only
   printf '%s' "$CLIENT_SECRET" | docker compose -f deploy/compose.hardened.yaml exec -T vault \
-    zoeymcp login --mcp https://mcp.notes.example/mcp --name notes \
+    zoeymcp onboard https://mcp.notes.example/mcp --name notes \
     --issuer https://auth.notes.example --client-id existing-client --client-secret \
     --client-auth basic --redirect-uri http://127.0.0.1:8765/callback --yes > onboard-notes-1.yaml
   ```
@@ -1184,9 +1203,9 @@ the portal with it. For a policy file the commands are `zoeymcp check --config F
 FRAGMENT` and `zoeymcp check --config FILE`, then SIGHUP (§7); for a policy on stdin, `--config
 -`, then a restart.
 
-**The second run.** Once the policy names the credential, the same `login --mcp` command doesn't
+**The second run.** Once the policy names the credential, the same `onboard` command doesn't
 onboard again. It rediscovers (the probe and GETs; nothing is registered or stored), compares
-what it finds with the committed credential, route and server, and signs in with `zoeymcp
+what it finds with the committed credential, route and server, and connects with `zoeymcp
 login`'s paste flow (§2; `--rebind` passes through). A difference is refused
 `onboarding_mismatch`, naming each field that differs, never its value: revert the edit, or
 register a new client with `--reregister`. A stored client secret's binding is checked too
@@ -1212,13 +1231,13 @@ the same `review` command then tells you more. With `--no-connect` and no token 
 nothing to review with, so no review is queued.
 
 **Adopting a grant another tool holds.** Onboard with that tool's client
-(`login --mcp URL --client-id ID ...`) and commit fragment 1; stop the old holder's refreshes;
+(`onboard URL --client-id ID ...`) and commit fragment 1; stop the old holder's refreshes;
 seed its refresh token with `printf '%s' "$RT" | ... exec -T vault zoeymcp secret set
-<credential>-refresh`; then run `login --mcp URL --no-connect`, which compares and doesn't sign
-in. The second run skips signing in by itself whenever the credential already holds a refresh
+<credential>-refresh`; then run `onboard URL --no-connect`, which compares and doesn't
+connect. The second run skips connecting by itself whenever the credential already holds a refresh
 token, and says so. Keep that order for a rotating token (§5).
 
-**Re-registering** (`login --mcp URL --reregister`): a new client for the committed credential,
+**Re-registering** (`onboard URL --reregister`): a new client for the committed credential,
 under its own names. Discovery runs again, the new client's secret replaces the stored one, and
 fragment 1 replaces `credentials.<credential>` whole: its header line says so, and a comment names
 each field that changed. What you set beyond the client and the endpoints (the scopes unless you
@@ -1227,7 +1246,7 @@ when it authenticates differently. A credential with `token_headers`, or with a 
 `extra_params` or `authorize_params`, can't be written into a fragment, so it is refused
 `reregister_by_hand` before anything is asked or stored: edit that credential by hand. If
 anything fails after the new client's secret is stored, the vault puts the committed secret back
-and the answer says `secret_restored`. After the commit, sign in again with `zoeymcp login
+and the answer says `secret_restored`. After the commit, connect again with `zoeymcp login
 <credential> --rebind`: the old grant belongs to the old client, and `--rebind` accepts its new
 binding when the token endpoint moved.
 
@@ -1268,7 +1287,7 @@ file alone.
 | It restarts after a client secret was stored, before the commit | the secret stays (health reports it `unreferenced` until fragment 1 is committed): commit the fragment you were shown, or run the same command to see fragment 1 again, which stores nothing |
 | It restarts after it registered a public client, before the commit | its `<credential>-client-id` entry stays, likewise: commit the fragment, or run the same command to see fragment 1 again, which registers nothing |
 | A registration times out | `dcr_failed`: the provider may hold a client nobody uses; the same command registers a new one |
-| The commit recreates the vault (inline `ZOEYMCP_CONFIG`) | nothing is lost: run `login --mcp` again to sign in |
+| The commit recreates the vault (inline `ZOEYMCP_CONFIG`) | nothing is lost: run `onboard` again to connect |
 | It restarts during the sign-in | the sign-in is lost (§2): run it again; a stored client secret stays |
 | The store is lost | the client secret with it: onboard again with a new client (`--reregister` once the policy names the credential); the old client stays registered at the provider |
 
@@ -1309,7 +1328,7 @@ which asks the vault for work and never takes a connection from it, runs the sam
 `zoeymcp review` and posts its result back: `zoeymcp review <server> --via vault` in the vault's
 container (both tiers: `docker compose -f deploy/compose.hardened.yaml exec vault zoeymcp review
 notes --via vault`, or `docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp review notes
---via vault`), and the second `login --mcp`. `--via auto`, the default, takes the gateway's admin
+--via vault`), and the second `onboard`. `--via auto`, the default, takes the gateway's admin
 socket when the container has it, as the standard tier's does, else the vault's; `--via gateway`
 is the review over the gateway's socket as before, and the summary (`review` with no server) is
 only that. `review <server> --via vault --clear` queues a clear job: the gateway lists the server
@@ -1889,7 +1908,7 @@ ledger can't be written, nothing is asked.
 
 ```sh
 zoeymcp ledger --since 1d                 # recent calls: ref, client, tool, decision, outcome
-zoeymcp ledger --verify                   # walk the hash chain
+zoeymcp ledger verify                     # walk the hash chain
 zoeymcp ledger check <ref> args.json      # were these the arguments that call was shown with?
 ```
 
@@ -1945,11 +1964,11 @@ error's type) at most once per 5 minutes. Approvals never wait for a report. Rea
 vault, or on the portal's Ledger page (§26):
 
 ```sh
-zoeymcp ledger --vault                    # the copy's state, then the newest 200 calls with their sends
-zoeymcp ledger --vault --before 980       # older ones
-zoeymcp ledger --vault --format json
-zoeymcp ledger --vault --chain vault      # only the calls the vault's own chain holds
-zoeymcp ledger --vault --verify           # walk the vault's own chain with the vault's key
+zoeymcp ledger vault                     # the copy's state, then the newest 200 calls with their sends
+zoeymcp ledger vault --before 980        # older ones
+zoeymcp ledger vault --format json
+zoeymcp ledger vault --chain vault       # only the calls the vault's own chain holds
+zoeymcp ledger vault --verify            # walk the vault's own chain with the vault's key
 ```
 
 `--chain both` (the default) joins the vault's own chain to the copy by ref, never by digest
@@ -1997,7 +2016,7 @@ by `zoeymcp health` (`ledger_copy_refused`):
 Once you have decided why:
 
 ```sh
-zoeymcp ledger --vault --restart-chain
+zoeymcp ledger vault --restart-chain
 ```
 
 or **Restart the chain** on the portal's Ledger page, confirmed with a passkey. Either shows what
@@ -2342,8 +2361,8 @@ sessions stay.
 **Sessions.** The Sessions page lists every signed-in browser, by fingerprint, with its origin,
 the passkey it signed in with, and when it was made and last used; **End the other sessions**
 ends every one but yours. `zoeymcp sessions` lists the same from the host, one line a session
-(`--format json` for the vault's answer whole), and `zoeymcp sessions --end-all` ends them all,
-including any you are signed in with. At most 8 sessions are kept; a ninth sign-in ends the
+(`--format json` for the vault's answer whole), and `zoeymcp sessions end` ends them all,
+including any you are signed in with, after asking. At most 8 sessions are kept; a ninth sign-in ends the
 one used least recently.
 
 **Passkeys.** The Passkeys page lists every passkey that can sign in, by name and fingerprint:
@@ -2354,7 +2373,7 @@ adds one from a signed-in session (after the step-up below, the browser asks the
 authenticator to create it; an authenticator that already holds one of this address's passkeys
 is refused by the browser). **Rename** and **Remove** act on one. Removing a passkey ends every
 session it signed in, yours too if it was the one; the portal never removes the last passkey
-(enrol another first, or use `zoeymcp passkeys --remove` or `zoeymcp setup-code --reset` from
+(enrol another first, or use `zoeymcp passkeys remove` or `zoeymcp setup-code --reset` from
 the host). `zoeymcp passkeys` lists the same from the host.
 
 **Step-up.** Every change in the portal asks for a passkey first, in two steps. The vault checks
@@ -2439,7 +2458,7 @@ compose command in front, `docker compose -f deploy/compose.hardened.yaml exec v
 - `needs_review`: connected, and the policy includes none of its tools. **Review tools**.
 - `reviewed`: **Review again**; the tools it serves and the clients it is assigned to; for a
   server whose credential names its resource, as onboarding by URL writes it, **Register a new
-  client** is `zoeymcp login --mcp URL --reregister` (§11), which the portal doesn't run.
+  client** is `zoeymcp onboard URL --reregister` (§11), which the portal doesn't run.
 - `blocked`: your own egress proxy refused the vault (§28). **Show the hosts to allow** lists
   them with the Squid lines; allow them, then **Try again**: it puts the onboarding's own URL and
   names back in the form and discovers again (with the form's other options), so the onboarding
@@ -2592,7 +2611,7 @@ the gateway's container. The state line says where the copy's head is, when it l
 whether its files stop chaining. While the copy refuses reports (`fork`, `gap` or `full`, §21),
 every page has a banner, and **Restart the chain** shows, before the passkey prompt, the state
 it lifts, the live chain it archives and every archived chain it deletes to stay within 64 MiB,
-each with its seq range, when it was received and its size; it does what `zoeymcp ledger --vault
+each with its seq range, when it was received and its size; it does what `zoeymcp ledger vault
 --restart-chain` does. If the copy changes between the summary and the prompt (a restart from the
 host, say), the vault refuses with what it finds now. Archived chains are listed at the bottom,
 each with **Show its rows**; a deleted one keeps only its head, as an anchor. A copy the vault
@@ -2683,7 +2702,7 @@ removing one ends its sessions. Another `http://localhost` port takes the passke
 different host name has its own: issue a setup code and redeem it **on the new origin**.
 
 **Recovery.** One passkey lost while another works: sign in with the other and remove the lost
-one on the Passkeys page (or `zoeymcp passkeys --remove FINGERPRINT` from the host).
+one on the Passkeys page (or `zoeymcp passkeys remove FINGERPRINT` from the host).
 Every passkey lost: `zoeymcp setup-code` adds one, or `--reset` replaces them all. A passkey or
 device that may be stolen, or a passkey file reported tampered (`passkey_store_tampered`, and
 the portal answering "can't be verified"): `zoeymcp setup-code --reset`. A reset enrolment
@@ -2704,7 +2723,7 @@ own network, enrol, rename or remove a passkey, restart the ledger chain, or, in
 save a review or an onboarding's server, re-pin a tool, move one to allow, give a server to a
 client or take it away, pause, resume or change a connector's limits, or roll back the policy:
 each needs a fresh passkey prompt bound to that change. If you think a session was taken, **End the other
-sessions** (or `zoeymcp sessions --end-all` from the host); the threat model
+sessions** (or `zoeymcp sessions end` from the host); the threat model
 ([threat-model.md](threat-model.md)) has the rest.
 
 **Checks for a verify script.** None of these changes anything:
@@ -2836,7 +2855,7 @@ policy changed this credential's issuer since the sign-in started: it was `<old>
 | 502 | `egress_refused` | The egress role refused the vault's connection to `<host>`: it hadn't fetched the onboarding's hosts yet, its key is out of date, or it refused or couldn't reach the host's address. Its egress_refused log line names which; if it hadn't fetched yet, run the same command again. |
 | 409 | `private_needs_direct` | A server on your network can't be onboarded through the egress role, which can't keep its private exception to this onboarding. Onboard it with egress_proxy unset, or add it to the policy by hand. |
 | 409 | `already_configured` | The server `<server>` already reaches this URL, with a credential of kind `<kind>`, not oauth2. Remove it, its route and that credential from the policy and reload first; in managed mode, export the policy, remove them and import it with zoeymcp policy import. |
-| 409 | `onboarding_mismatch` | The committed policy differs from what the server publishes now, at `<fields>`. Revert the edit, or register a new client with zoeymcp login --mcp URL --reregister. |
+| 409 | `onboarding_mismatch` | The committed policy differs from what the server publishes now, at `<fields>`. Revert the edit, or register a new client with zoeymcp onboard URL --reregister. |
 | 409 | `reregister_by_hand` | The credential `<credential>` sets `<field>`, which a re-registration's fragment can't carry (`<why>`). Re-register by hand: edit the credential in the policy. |
 | 502 | `address_refused` | The vault doesn't connect to `<host>`: its name resolves to a private, loopback or reserved address. Nothing was sent to it. |
 | 502 | `resolve_failed` | The name `<host>` didn't resolve, so nothing was sent to it. |
@@ -3129,7 +3148,8 @@ docker compose -f deploy/compose.yaml run --rm --no-deps -T zoeymcp \
     check --emit-egress-allowlist --allowlist-format squid > proxy/zoeymcp.conf
 ```
 
-**Comparing.** `--check FILE` compares FILE with what would be emitted, line endings aside: exit 0
+**Comparing.** `--compare FILE` (or `--check FILE`) compares FILE with what would be emitted,
+line endings aside: exit 0
 when they match, 1 with each difference listed (`missing:`, `unexpected:`, or `order:` for the
 first line out of place), 2 when FILE can't be read. Put it in your verify script:
 
@@ -3217,7 +3237,7 @@ emitted snippet: it parses it, refuses a listed name answering `10.x`, `::ffff:1
 of public and private, and an address whose PTR name is listed, and lets a listed public name
 through.
 
-**Onboarding through it.** With onboarding by URL (`zoeymcp login --mcp`, §11), the
+**Onboarding through it.** With onboarding by URL (`zoeymcp onboard`, §11), the
 proxy refuses the hosts the policy doesn't name yet. The vault then stops and answers
 `proxy_refused` with every host it has learned so far and the Squid lines that allow them, in
 the snippet's shape, reusing its `zoeymcp_private_dst` and its `zoeymcp_port_<n>` ACLs (a port
@@ -3516,7 +3536,7 @@ out for none). The steps:
 3. **The policy.** The compose file's `ZOEYMCP_CONFIG` is the policy (or put it in a file, §7).
    Put the agent's `token_sha256` under `gateway.clients.agent1`, and give it no servers yet
    (`servers: []`). Remove the example `notes` server, its route `notes-mcp` and its credential
-   `notes-key` before you onboard a server at that URL: `login --mcp` refuses a URL a server
+   `notes-key` before you onboard a server at that URL: `onboard` refuses a URL a server
    already reaches with another kind of credential (`already_configured`). Keep or remove the
    `stats` route; if you keep it, replace its placeholder with a long random value. Then prove the
    file: `$c run --rm --no-deps vault check`.
@@ -3530,14 +3550,14 @@ out for none). The steps:
 7. **A remote MCP server, by its URL** (§11, "Onboarding by URL"):
 
    ```sh
-   $c exec vault zoeymcp login --mcp https://mcp.notes.example/mcp --name notes > onboard-notes-1.yaml
+   $c exec vault zoeymcp onboard https://mcp.notes.example/mcp --name notes > onboard-notes-1.yaml
    $c run --rm --no-deps -v "$PWD:/w:ro" vault check --with /w/onboard-notes-1.yaml
    ```
 
    The plan and the `Next:` list go to the terminal, fragment 1 to the file. Merge fragment 1
    into `ZOEYMCP_CONFIG` (`check --with /w/onboard-notes-1.yaml --print-merged --for compose`
    prints the whole block to paste over it), prove the edited file with `$c run --rm --no-deps
-   vault check`, and recreate the vault (step 6). Then run the same `login --mcp` command again,
+   vault check`, and recreate the vault (step 6). Then run the same `onboard` command again,
    without the redirect: it compares the server with fragment 1, prints the sign-in link (open
    it, approve, paste back the address you land on), and queues the server's review, which the
    gateway runs. A server that offers neither a client you registered (`--client-id`) nor
@@ -4410,8 +4430,8 @@ docker compose -f deploy/compose.hardened.yaml run --rm --no-deps -T vault polic
 docker compose -f deploy/compose.hardened.yaml up -d vault
 ```
 
-**`policy seed --state /state [--config FILE|-]`** seeds revision 1 on a volume the vault won't seed
-by itself (the guard above), from `ZOEYMCP_CONFIG` unless `--config` names another. It shows the
+**`policy seed --state /state [FILE|-]`** seeds revision 1 on a volume the vault won't seed
+by itself (the guard above), from `ZOEYMCP_CONFIG` unless FILE (or `--config FILE`) names another. It shows the
 clients, routes and servers, the `env:` names the policy allows and how many literal client tokens
 it writes as their hash, and records the host as the seed's author (`policy_seeded ...
 via=offline`). With a store or its anchor present it refuses and names the reseed.
@@ -4470,7 +4490,8 @@ tier); `--format json` prints the vault's answer instead:
 - `zoeymcp policy` (or `policy head`): the mode and, in managed mode, the head: when, how and by
   whom it was written, its deployment and digest (8 characters each), the revision the
   gateway runs (`applied`, `pending`, or `unknown` before its first status report), and the
-  highest revision of this deployment the gateway has seen (its witness, below);
+  highest revision of this deployment the gateway has seen (its witness, below). With `--state
+  DIR`, offline with the vault stopped, it shows the store's head alone: the gateway isn't asked;
 - `zoeymcp policy history [--before N] [--limit N]`: the kept revisions, newest first, each with
   what made it (`policy.seed`, `policy.save`, `policy.import`, `policy.rollback`, ...), by whom
   (a passkey's fingerprint, the host and how, or the seed), its base, a rollback's target and the
@@ -4895,7 +4916,8 @@ cases:
 
    It then prints the `approvers` lines. With `--apply` in managed mode it plans a host import of
    them, shows the plan and asks `[y/N]`; without it, or in declarative mode, add the lines
-   yourself and reload. Nothing is written before you answer. An enrolment stops with
+   yourself and reload (`--apply` in declarative mode says it only applies in managed mode).
+   Nothing is written before you answer. An enrolment stops with
    `enrolment_contested` (and health raises `approver_contested`) if the code is presented twice,
    or another program polls the bot or set a webhook on it; with `enrolment_unconfirmed` for a
    wrong code (type the code: a paste may not reach the hidden prompt, and what isn't six digits
@@ -5073,7 +5095,7 @@ button's data carry it. `zoeymcp approvals show` and `withdraw` take either.
 | `zoeymcp approvals withdraw <ref-or-id>`, `--all` | withdraws (nothing is sent, the messages are edited, the agents are told); `--all` is the emergency stop (§35) |
 | `zoeymcp approver telegram enrol --secret <name> [--apply]` | finds your Telegram ids (§36.2) |
 | `zoeymcp approver telegram test` | sends a message with no buttons; exits 0 when Telegram took it |
-| `zoeymcp ledger --vault --chain vault\|copy\|both`, `--verify` | the two chains joined, or one; `--verify` walks the vault's chain (§21) |
+| `zoeymcp ledger vault --chain vault\|copy\|both`, `--verify` | the two chains joined, or one; `--verify` walks the vault's chain (§21) |
 
 No command approves: that takes your passkey or your Telegram account.
 

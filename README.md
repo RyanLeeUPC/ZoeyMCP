@@ -32,7 +32,7 @@ Built so far:
 - **M4, approvals, mail and toolkits:** `approve` tools ask a human through the agent's own
   client (MCP elicitation, both protocol eras) with a gateway-rendered prompt that shows the
   exact call and can't hide text, then run that call once; a per-call lock, cooldown and hourly
-  cap; a hash-chained, HMAC-keyed approval ledger with `zoeymcp ledger --verify`; approved calls
+  cap; a hash-chained, HMAC-keyed approval ledger with `zoeymcp ledger verify`; approved calls
   that finish when the agent leaves or the gateway stops. The vault's SMTP connector sends with an
   app password it alone holds, to fixed recipients, over verified TLS, optionally through CONNECT,
   with idempotency keys, a rolling daily limit and a journal that never sends twice. Toolkits:
@@ -47,7 +47,7 @@ Built so far:
   `zoeymcp health`); the gateway's approval ledger pushed to an append-only copy in the vault,
   with the sends no call explains; and a read-only view of the declarative policy. An OAuth
   credential for a remote MCP server whose client you register yourself.
-- **M7, onboarding, the egress role and the bridge:** `zoeymcp login --mcp URL` and the portal's MCP
+- **M7, onboarding, the egress role and the bridge:** `zoeymcp onboard URL` and the portal's MCP
   servers page add an OAuth-protected remote MCP server from its URL: discovery of its
   protected-resource and authorization-server metadata through a guarded client, a client the
   provider registered for you or one the vault registers (dynamic client registration), with any
@@ -152,20 +152,21 @@ the container. A server that signs in with OAuth is then added by its URL in two
 (operations.md §11), with the example `notes` removed as above:
 
 ```sh
-docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp login \
-  --mcp https://mcp.notes.example/mcp --name notes > onboard-notes-1.yaml
+docker compose -f deploy/compose.yaml exec zoeymcp zoeymcp onboard \
+  https://mcp.notes.example/mcp --name notes > onboard-notes-1.yaml
 docker compose -f deploy/compose.yaml run --rm --no-deps -v "$PWD:/w:ro" zoeymcp \
   check --with /w/onboard-notes-1.yaml
 ```
 
 The plan shows every host the vault contacts and what it will register; fragment 1 adds the
 credential, its route and the server with no tools. Merge it into the policy, check the edited
-file, recreate the container, and run the same `login --mcp` command again: it signs in (paste
-the address the provider sends you to) and has the gateway review the server's tools. The two
+file, recreate the container, and run the same `onboard` command again: it connects the
+credential (paste the address the provider sends you to) and has the gateway review the server's
+tools. (`zoeymcp login --mcp URL` is the same command under its older name.) The two
 commands it prints next make fragment 2, the tools you pick and classify; commit it as the
 first, put `notes` back in the client's `servers`, and the agent's configuration above stays as
 it is. The portal's MCP servers page does the same in a browser. In managed mode none of this
-prints a fragment: `review` with `--add` or another choosing option, and `login --mcp`, refuse
+prints a fragment: `review` with `--add` or another choosing option, and `onboard`, refuse
 and name the portal, or `zoeymcp policy export`, an edit and `zoeymcp policy import`, instead
 (operations.md §11); `check` says it checks the document it is given, not the running revision.
 

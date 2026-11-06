@@ -878,7 +878,8 @@ def test_s6_env_seed_promotion_and_reseeding(
             assert last_refresh() == ("live", "reseed_never")
             assert auth.refresh_calls[-1].refresh_token == live.rt.reveal()
             # Deleting the live slot re-seeds from the env value the vault started with.
-            assert w.cli(["secret", "delete", LIVE]) == (0, f"Deleted {LIVE}.\n", "")
+            # The policy uses the live slot: --yes, as a script deletes it (D9).
+            assert w.cli(["secret", "delete", LIVE, "--yes"]) == (0, f"Deleted {LIVE}.\n", "")
             assert w.get(TOP).status_code == 200
             assert last_refresh() == ("seed", "no_live")
             assert auth.refresh_calls[-1].refresh_token == second
@@ -1039,7 +1040,7 @@ def test_s6_the_grant_lifetime_is_warned_about_then_ends(
     with shape(tmp_path, ca, monkeypatch, SPOTIFY, auth, clock) as w, w.running():
         code, out, _ = w.login("spotify")
         assert code == 0
-        [ends] = re.findall(r"^The grant ends at (\S+); run login again before then\.$", out, re.M)
+        [ends] = re.findall(r"^The grant ends at (\S+); connect again before then: ", out, re.M)
         clock.advance(DAY)
         assert w.get(TOP).status_code == 200
         assert w.status()["reconsent_due"] is None

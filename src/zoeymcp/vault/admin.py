@@ -907,7 +907,17 @@ class AdminApp:
         )
 
     async def _list(self, request: Request) -> Response:
-        return JSONResponse({"secrets": [json_safe(m.as_dict()) for m in self._store.metadata()]})
+        """Each entry's metadata, and whether the running policy uses it (``used``), which
+        ``secret delete`` asks about first (D9)."""
+        used = health.used_names(self._policy())
+        return JSONResponse(
+            {
+                "secrets": [
+                    {**json_safe(m.as_dict()), "used": m.name in used}
+                    for m in self._store.metadata()
+                ]
+            }
+        )
 
     async def _put(self, request: Request) -> Response:
         name = request.path_params["name"]

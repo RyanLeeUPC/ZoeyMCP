@@ -926,7 +926,7 @@ def committed_next(found: Committed, held: TokenState) -> tuple[NextStep, ...]:
     review the second run queued once it is done (OPS-11)."""
     steps = []
     if held == "none":
-        steps.append(NextStep("connect", "Sign in", ("zoeymcp", "login", found.credential), "exec"))
+        steps.append(NextStep("connect", "Connect", ("zoeymcp", "login", found.credential), "exec"))
     return (*steps, *choose_next(found.server))
 
 
@@ -1088,7 +1088,7 @@ def onboard_again(server_url: str) -> NextStep:
     return NextStep(
         "onboard_again",
         "Register a new client",
-        ("zoeymcp", "login", "--mcp", server_url, "--reregister"),
+        ("zoeymcp", "onboard", server_url, "--reregister"),
         "exec",
     )
 
@@ -1260,9 +1260,9 @@ def widen_scope(policy: Policy, credential: str, challenged: Collection[str]) ->
 
 
 def _login_again(record: OnboardingRecord) -> tuple[str, ...]:
-    """The second ``login --mcp``, with the names and the discovery options of the first."""
+    """The second ``onboard URL``, with the names and the discovery options of the first."""
     names = record.names
-    command = ["zoeymcp", "login", "--mcp", record.server_url]
+    command = ["zoeymcp", "onboard", record.server_url]
     if names.credential == names.route == names.server:
         command += ["--name", names.credential]
     else:
@@ -1340,7 +1340,7 @@ def _saved(record: OnboardingRecord) -> tuple[NextStep, ...]:
     managed mode. A proxy's allowlist, when the save needs it, is the save's own way on."""
     login: tuple[str, ...] = ("zoeymcp", "login", record.names.credential)
     if record.options.reregister:
-        label, login = "Then sign in with the new client", (*login, "--rebind")
+        label, login = "Then connect with the new client", (*login, "--rebind")
     else:
         label = "Then connect, and review its tools"
     return (NextStep("save", SAVE_LABEL), NextStep("connect", label, login, "exec"))
@@ -1374,9 +1374,9 @@ def _commit(record: OnboardingRecord, source: str, own_proxy: bool) -> tuple[Nex
         # which discards it on purpose: --rebind, since a token endpoint that moved changes the
         # old grant's binding.
         login = ("zoeymcp", "login", record.names.credential, "--rebind")
-        steps.append(NextStep("connect", "Then sign in with the new client", login, "exec"))
+        steps.append(NextStep("connect", "Then connect with the new client", login, "exec"))
     else:
-        steps.append(NextStep("connect", "Then sign in and review", _login_again(record), "exec"))
+        steps.append(NextStep("connect", "Then connect and review", _login_again(record), "exec"))
     return tuple(steps)
 
 

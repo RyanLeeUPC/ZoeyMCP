@@ -410,7 +410,7 @@ async def test_a_given_public_client(
         made["next"][0]["command"]
         == "zoeymcp check --config policy.yaml --with onboard-notes-1.yaml"
     )
-    assert made["next"][-1]["command"] == f"zoeymcp login --mcp {SERVER_URL} --name notes"
+    assert made["next"][-1]["command"] == f"zoeymcp onboard {SERVER_URL} --name notes"
     # Every request was a fixed probe or a GET, each through the guard to a checked address.
     assert [(r.method, r.path) for r in mcp.received] == [
         ("POST", "/mcp"),
@@ -1259,9 +1259,7 @@ async def test_a_private_server_needs_allow_private(
     assert plan["plan"]["resource"] == LAN_URL
     fragment = load_mapping(made["diff"]["yaml"])
     assert fragment["egress_private"] == [f"{LAN}:443"]
-    assert made["next"][-1]["command"] == (
-        f"zoeymcp login --mcp {LAN_URL} --name lan --allow-private"
-    )
+    assert made["next"][-1]["command"] == (f"zoeymcp onboard {LAN_URL} --name lan --allow-private")
     started = [r for r in records(lines) if r["event"] == "onboard_started"]
     assert [r["allow_private"] for r in started] == [False, True]
     assert {r["host"] for r in started} == {LAN}
@@ -1983,7 +1981,7 @@ async def test_the_second_run_compares_and_stores_nothing(
         },
     ]
     assert again["next"] == [
-        {"do": "connect", "label": "Sign in", "command": "zoeymcp login notes", "via": "exec"},
+        {"do": "connect", "label": "Connect", "command": "zoeymcp login notes", "via": "exec"},
         *review,
     ]
     assert (held["token"], held["next"]) == ("stored", review)
@@ -2041,7 +2039,7 @@ async def test_a_committed_field_that_differs_is_named(tmp_path: Path, lines: io
         {
             "do": "onboard_again",
             "label": "Register a new client",
-            "command": f"zoeymcp login --mcp {SERVER_URL} --reregister",
+            "command": f"zoeymcp onboard {SERVER_URL} --reregister",
             "via": "exec",
         }
     ]
@@ -2103,7 +2101,7 @@ async def test_the_second_run_checks_a_stored_secrets_binding(tmp_path: Path) ->
         status, body = await rig.refused(**CONFIDENTIAL)
     assert (fine["stage"], fine["plan"]["client_auth"]) == ("committed", "basic")
     assert (status, body["reason"]) == (409, "client_secret_binding_changed")
-    assert body["next"][0]["command"] == f"zoeymcp login --mcp {SERVER_URL} --reregister"
+    assert body["next"][0]["command"] == f"zoeymcp onboard {SERVER_URL} --reregister"
 
 
 # --- a re-registration (D.12, OPS-3, D-184) -------------------------------------------------------
@@ -2155,7 +2153,7 @@ async def test_a_reregistration_replaces_the_credential_and_its_secret(
     assert compared["stage"] == "committed"
     assert redone["next"][-1] == {
         "do": "connect",
-        "label": "Then sign in with the new client",
+        "label": "Then connect with the new client",
         "command": "zoeymcp login notes --rebind",
         "via": "exec",
     }

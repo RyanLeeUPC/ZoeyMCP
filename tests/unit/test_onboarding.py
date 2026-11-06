@@ -1209,8 +1209,8 @@ def test_the_steps_after_fragment_1_for_an_inline_policy() -> None:
         {"do": "reload", "label": "Commit, then recreate the vault", "via": "up"},
         {
             "do": "connect",
-            "label": "Then sign in and review",
-            "command": "zoeymcp login --mcp https://mcp.notes.example/mcp --name notes",
+            "label": "Then connect and review",
+            "command": "zoeymcp onboard https://mcp.notes.example/mcp --name notes",
             "via": "exec",
         },
     ]
@@ -1227,7 +1227,7 @@ def test_the_steps_after_fragment_1_for_a_policy_file() -> None:
         ("commit_fragment", "", None),
         ("check_policy", "zoeymcp check --config '/config/my policy.yaml'", None),
         ("reload", "", None),
-        ("connect", "zoeymcp login --mcp https://mcp.notes.example/mcp --name notes", "exec"),
+        ("connect", "zoeymcp onboard https://mcp.notes.example/mcp --name notes", "exec"),
     ]
     assert steps[1].label == (
         "Merge it into the policy, or print the whole merged policy with --print-merged and "
@@ -1279,8 +1279,7 @@ def test_the_second_run_carries_the_names_and_discovery_options() -> None:
     connect = next_for(staged("registered", options, names), INLINE_SOURCE)[-1]
     assert connect.command == (
         "zoeymcp",
-        "login",
-        "--mcp",
+        "onboard",
         SERVER,
         "--credential",
         "c",
@@ -1303,11 +1302,11 @@ def test_every_argument_is_shell_quoted() -> None:
     hostile = "https://mcp.notes.example/a;id|x&y`z`$(w)"
     step = onboard_again(hostile)
     assert step.shell() == (
-        "zoeymcp login --mcp 'https://mcp.notes.example/a;id|x&y`z`$(w)' --reregister"
+        "zoeymcp onboard 'https://mcp.notes.example/a;id|x&y`z`$(w)' --reregister"
     )
     record = replace(staged("registered"), server_url="https://mcp.notes.example/;id")
     assert next_for(record, INLINE_SOURCE)[-1].shell() == (
-        "zoeymcp login --mcp 'https://mcp.notes.example/;id' --name notes"
+        "zoeymcp onboard 'https://mcp.notes.example/;id' --name notes"
     )
 
 
@@ -1315,7 +1314,7 @@ def test_onboard_again() -> None:
     assert onboard_again(SERVER).answer() == {
         "do": "onboard_again",
         "label": "Register a new client",
-        "command": "zoeymcp login --mcp https://mcp.notes.example/mcp --reregister",
+        "command": "zoeymcp onboard https://mcp.notes.example/mcp --reregister",
         "via": "exec",
     }
 
@@ -1438,7 +1437,7 @@ def test_the_second_runs_steps() -> None:
         },
     ]
     assert [step.answer() for step in committed_next(found, "none")] == [
-        {"do": "connect", "label": "Sign in", "command": "zoeymcp login c", "via": "exec"},
+        {"do": "connect", "label": "Connect", "command": "zoeymcp login c", "via": "exec"},
         *review,
     ]
     assert [step.answer() for step in committed_next(found, "stored")] == review
@@ -1615,7 +1614,7 @@ def test_a_first_onboarding_ends_by_its_credentials_name() -> None:
 def test_a_reregistration_signs_in_with_the_new_client() -> None:
     steps = next_for(staged("registered", Options(client_id="zc_new", reregister=True)), "p.yaml")
     login = ("zoeymcp", "login", "notes", "--rebind")
-    assert steps[-1] == NextStep("connect", "Then sign in with the new client", login, "exec")
+    assert steps[-1] == NextStep("connect", "Then connect with the new client", login, "exec")
 
 
 # --- the portal's server rows (K.1, GR-21) ------------------------------------------------------
@@ -1989,7 +1988,7 @@ def test_the_steps_after_registering_in_managed_mode() -> None:
     login = ("zoeymcp", "login", "notes", "--rebind")
     assert steps == (
         NextStep("save", "Save the server's credential, route and server"),
-        NextStep("connect", "Then sign in with the new client", login, "exec"),
+        NextStep("connect", "Then connect with the new client", login, "exec"),
     )
     # A blocked one is the same in either mode (D.11).
     blocked = staged("blocked")

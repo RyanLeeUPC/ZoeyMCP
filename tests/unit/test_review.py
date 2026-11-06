@@ -498,7 +498,7 @@ def test_the_summary() -> None:
     assert view.summary(stale) == ([view.NO_SERVERS, view.NOT_FRESH], 1)
     # Each names the next step (D16).
     assert view.NO_SERVERS == (
-        "No gateway servers. Add one in the portal's MCP servers, or with login --mcp URL "
+        "No gateway servers. Add one in the portal's MCP servers, or with zoeymcp onboard URL "
         "(declarative mode)."
     )
     assert view.NOT_FRESH == (

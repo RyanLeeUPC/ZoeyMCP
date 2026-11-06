@@ -432,8 +432,7 @@ CATALOGUE: Final[Mapping[str, Entry]] = MappingProxyType(
         "onboarding_mismatch": Entry(
             409,
             "The committed policy differs from what the server publishes now, at {fields}. "
-            "Revert the edit, or register a new client with zoeymcp login --mcp URL "
-            "--reregister.",
+            "Revert the edit, or register a new client with zoeymcp onboard URL --reregister.",
         ),
         "reregister_by_hand": Entry(
             409,

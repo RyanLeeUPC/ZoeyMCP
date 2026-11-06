@@ -15,7 +15,7 @@ command. The kinds are :func:`~.oauth.login.hint_action`'s (``connect``, ``reset
 ``delete_secret``, ``check_volume`` and ``check_mailbox``, and for the passkeys ``add_passkey``,
 ``review_passkeys`` and ``reset_passkeys``, and for the reported ledger ``check_gateway`` and
 ``read_ledger``, and for the vault hold ``list_approvals``; from M7, ``onboard_again`` with the
-``command`` (``login --mcp URL --reregister``, OPS-3), ``widen_scope`` with the union ``scope``
+``command`` (``onboard URL --reregister``, OPS-3), ``widen_scope`` with the union ``scope``
 and the ``fragment`` that sets it (D.5's step-up, SPEC-11), which ``connect`` follows, and
 ``check_egress_role``; from M6, ``review`` with the ``server`` (M6 design M.5).
 
@@ -840,9 +840,10 @@ def _connector(
     }
 
 
-def _store(inputs: Inputs) -> dict[str, Any]:
-    """Entries nothing uses, and a store that can't be written."""
-    policy = inputs.policy
+def used_names(policy: Policy) -> set[str]:
+    """The store entries ``policy`` uses: its ``store:`` references, the live slot of each
+    seeded credential and the approver's token. ``secret list`` marks them, so ``secret delete``
+    asks first (M8 UX pass, D9)."""
     used = {ref.removeprefix("store:") for _, ref, _ in secret_references(policy)}
     used |= {live_slot(name) for name, cred in policy.credentials.items() if _seeded(cred)}
     # The approver's token isn't among secret_references (its own sharing rules, check.py),
@@ -850,6 +851,12 @@ def _store(inputs: Inputs) -> dict[str, Any]:
     telegram = policy.approvers.telegram if policy.approvers is not None else None
     if telegram is not None:
         used.add(telegram.bot_token.removeprefix("store:"))
+    return used
+
+
+def _store(inputs: Inputs) -> dict[str, Any]:
+    """Entries nothing uses, and a store that can't be written."""
+    used = used_names(inputs.policy)
     findings: list[Finding] = []
     for entry in inputs.entries:
         if entry.name in used:

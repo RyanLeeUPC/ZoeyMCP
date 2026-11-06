@@ -169,6 +169,15 @@ async def test_set_list_delete(tmp_path: Path) -> None:
     listing = await rig.call("GET", "/secrets")
     assert "lfm-123456" not in listing.text
     assert [s["name"] for s in listing.json()["secrets"]] == ["music-stats"]
+    # Whether the running policy uses each, for secret delete's question (D9).
+    assert [s["used"] for s in listing.json()["secrets"]] == [True]
+    await rig.call("PUT", "/secrets/extra", {"value": "v-123456", "origins": ["https://x.example"]})
+    listing = await rig.call("GET", "/secrets")
+    assert {s["name"]: s["used"] for s in listing.json()["secrets"]} == {
+        "extra": False,
+        "music-stats": True,
+    }
+    assert (await rig.call("DELETE", "/secrets/extra")).status_code == 200
     assert (await rig.call("DELETE", "/secrets/music-stats")).status_code == 200
     assert (await rig.call("DELETE", "/secrets/music-stats")).status_code == 404
 
@@ -1059,7 +1068,9 @@ def test_cli_over_the_socket(tmp_path: Path, socket_dir: Path) -> None:
         assert out.strip() == f"ZOEYMCP_GATEWAY_KEY={KEYS.gateway_key(1)}"
         code, out, err = cli(["setup-code", "--socket", sock])
         assert code == 0
-        assert "Open http://localhost:8081 or https://zoeymcp.tailnet.example, choose I have a" in err
+        assert (
+            "Open http://localhost:8081 or https://zoeymcp.tailnet.example, choose I have a" in err
+        )
         assert redeem(rig.setup, out.strip()) == Redeemed(int(rig.clock[0]) + 900, False)
         code, out, err = cli(["setup-code", "--reset", "--socket", sock])
         assert code == 0
@@ -1077,7 +1088,10 @@ def test_cli_over_the_socket(tmp_path: Path, socket_dir: Path) -> None:
         code, _, err = cli([*argv, "--socket", sock], stdin="rt-2")
         assert code == 1
         assert "drop --origin" in err
-        assert cli(["secret", "delete", "music-stats", "--socket", sock])[0] == 0
+        # The policy uses it: off a terminal, nothing is deleted without --yes (D9).
+        argv = ["secret", "delete", "music-stats", "--socket", sock]
+        assert cli(argv)[0] == 1
+        assert cli([*argv, "--yes"])[0] == 0
 
 
 def test_cli_secret_set_in_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

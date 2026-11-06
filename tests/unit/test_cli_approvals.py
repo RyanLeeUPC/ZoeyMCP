@@ -185,6 +185,9 @@ def test_list(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: BlockingP
     ]
     code, out, _ = run_cli(["approvals", "list", "--format", "json"])
     listed = json.loads(out)
+    # D14: list is the default, and the command takes --format and --socket for it.
+    assert run_cli(["approvals", "--format", "json"]) == (0, out, "")
+    assert run_cli(["approvals", "--format", "json", "list"]) == (0, out, "")
     assert [(r["ref"], r["approval"]) for r in listed["waiting"]] == [
         (REFS[0], first.id),
         (REFS[1], second.id),
@@ -400,10 +403,36 @@ def test_enrol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: Blocking
         f"{OPERATOR_ID}.",
         "The bot sent that chat a confirmation code. Type it here: ",
         "Confirmed.",
-        *approver_cli.RELOAD,
+        *approver_cli.reload_lines(admin_client.Prefix.for_role("vault")),
     ]
     assert (out + err).count(found.group(1)) == 1
     rig.close()
+
+
+def test_enrol_apply_in_declarative_mode_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, portal: BlockingPortal
+) -> None:
+    """D17: --apply in declarative mode isn't ignored in silence: one line says it applies only
+    in managed mode, then the lines and the reload step as without it."""
+    rig = Rig(tmp_path, monkeypatch, portal)
+    argv = ["approver", "telegram", "enrol", "--secret", "approver-bot", "--apply"]
+    code, out, err = enrol(rig, argv)
+    assert (code, out.startswith("approvers:\n")) == (0, True)
+    assert err.splitlines()[-3:] == [
+        "Confirmed.",
+        "--apply only applies in managed mode; this deployment is declarative.",
+        *approver_cli.reload_lines(admin_client.Prefix.for_role("vault")),
+    ]
+    rig.close()
+
+
+def test_the_reload_step_names_the_reload() -> None:
+    """D4: the reload as typed on the host, not prose."""
+    assert approver_cli.reload_lines(admin_client.Prefix()) == [
+        "Add these lines to the policy, then check it and reload the vault: docker compose -f "
+        "deploy/compose.hardened.yaml kill -s HUP vault (managed: run this again with --apply, "
+        "or export, edit and import). The reload starts the approver."
+    ]
 
 
 def test_what_cant_be_a_code_is_asked_again_unsent(
@@ -461,7 +490,9 @@ def test_a_lost_enrolment_can_be_stopped(
     assert (code, out.startswith("approvers:\n")) == (0, True)
     assert err.startswith(asked + "\nStopped it.\nOpened a temporary egress allowance")
     assert (lost.state, lost.reason) == ("ended", "enrolment_expired")
-    assert err.splitlines()[-1] == approver_cli.RELOAD[-1]
+    assert (
+        err.splitlines()[-1] == approver_cli.reload_lines(admin_client.Prefix.for_role("vault"))[-1]
+    )
     rig.close()
 
 

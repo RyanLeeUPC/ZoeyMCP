@@ -468,7 +468,7 @@ def counts_line(counts: Mapping[str, int]) -> str:
 
 
 NO_SERVERS: Final = (
-    "No gateway servers. Add one in the portal's MCP servers, or with login --mcp URL "
+    "No gateway servers. Add one in the portal's MCP servers, or with zoeymcp onboard URL "
     "(declarative mode)."
 )
 NOT_FRESH: Final = (

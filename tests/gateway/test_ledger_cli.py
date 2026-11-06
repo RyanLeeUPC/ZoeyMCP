@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 from pathlib import Path
@@ -197,10 +198,13 @@ def test_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert run(monkeypatch, admin, "check", REF_A, str(bad))[0] == 1
     code, out, _ = run(monkeypatch, admin, "check", "00000000000000ff", str(good))
     assert (code, out) == (1, "00000000000000ff: no asked record (pruned, or never asked)\n")
-    assert run(monkeypatch, admin, "check", REF_A)[0] == 2
-    assert run(monkeypatch, admin, "check", REF_A, str(tmp_path / "missing.json"))[0] == 2
-    code, _, err = run(monkeypatch, admin, REF_A)  # a REF without check
-    assert (code, err) == (2, "zoeymcp ledger: the only action is 'check REF FILE'\n")
+    # check takes REF and FILE, and a REF alone is no action: argparse says so, exit 2.
+    for argv in (("check", REF_A), (REF_A,)):
+        with pytest.raises(SystemExit) as info, contextlib.redirect_stderr(io.StringIO()):
+            run(monkeypatch, admin, *argv)
+        assert info.value.code == 2
+    code, _, err = run(monkeypatch, admin, "check", REF_A, str(tmp_path / "missing.json"))
+    assert (code, err.startswith("zoeymcp ledger check: can't read ")) == (2, True)
 
 
 def test_an_unreachable_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
