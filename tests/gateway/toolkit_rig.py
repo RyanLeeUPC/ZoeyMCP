@@ -1,6 +1,8 @@
 """A real vault with a records API route and a mail connector, and the gateway serving the example
 toolkits on it (M4 design H). The toolkits aren't installed: entry points are handed to the
-loader, and the origin check is skipped (``allow_writable``), as in development.
+loader, and the origin check is skipped (``allow_writable``), as in development. The gateway
+reaches the vault over TCP with the gateway key, or with ``link="unix"`` over the link socket with
+the peer check and no key (D-72; Linux only).
 """
 
 from __future__ import annotations
@@ -24,7 +26,16 @@ from tests.fakes.harness import serve
 from tests.fakes.records_api import SECRET as RECORDS_SECRET
 from tests.fakes.records_api import RecordsApi
 from tests.fakes.smtp_server import PASSWORD, USERNAME, SmtpFake, serve_smtp
-from tests.gateway.rig import KEYS, Reloadable, Running, WithAdmin, token_for
+from tests.gateway.rig import (
+    KEYS,
+    Link,
+    Reloadable,
+    Running,
+    WithAdmin,
+    serve_vault,
+    token_for,
+    vault_http,
+)
 from zoeymcp.common.policy import Policy
 from zoeymcp.common.policy.schema import hash_token
 from zoeymcp.common.policy.view import GatewayView, build_view
@@ -227,6 +238,7 @@ class Kit:
     state: Path
     log: io.StringIO
     raw: dict[str, Any] = field(default_factory=dict)
+    link: Link = "tcp"
 
     @property
     def view(self) -> GatewayView:
@@ -238,12 +250,13 @@ class Kit:
 
     def reload(self, **options: Any) -> None:
         self.raw = toolkit_policy(self.records_url, self.smtp_port, **options)
-        answer = httpx.post(self.vault_url + "/_test_reload", json=self.raw, timeout=10)
+        with vault_http(self.vault_url) as http:
+            answer = http.post("/_test_reload", json=self.raw)
         assert answer.status_code == 204, answer.text
 
 
 @contextmanager
-def kit(tmp_path: Path, ca: ProviderCA, **options: Any) -> Iterator[Kit]:
+def kit(tmp_path: Path, ca: ProviderCA, *, link: Link = "tcp", **options: Any) -> Iterator[Kit]:
     log = io.StringIO()
     logs.set_stream(log)
     records = RecordsApi()
@@ -258,9 +271,15 @@ def kit(tmp_path: Path, ca: ProviderCA, **options: Any) -> Iterator[Kit]:
             store.put("mail-pass", PASSWORD, derive_binding(policy, "mail-pass"))
             connectors = SmtpConnectors(tmp_path / "vault", KEYS, tls=ca.client_context())
             vault = VaultApp(
-                policy, store, KEYS, client=httpx.AsyncClient(), environ={}, connectors=connectors
+                policy,
+                store,
+                KEYS,
+                client=httpx.AsyncClient(),
+                environ={},
+                connectors=connectors,
+                gateway_link=link == "unix",
             )
-            with serve(Reloadable(vault)) as vault_url:
+            with serve_vault(Reloadable(vault), tmp_path, link) as vault_url:
                 yield Kit(
                     records,
                     smtp,
@@ -271,6 +290,7 @@ def kit(tmp_path: Path, ca: ProviderCA, **options: Any) -> Iterator[Kit]:
                     tmp_path / "gateway",
                     log,
                     raw=copy.deepcopy(raw),
+                    link=link,
                 )
     finally:
         logs.set_stream(None)
@@ -281,7 +301,7 @@ def toolkit_gateway(
     deployed: Kit, *, entry_points: list[importlib.metadata.EntryPoint] | None = None
 ) -> Iterator[Running]:
     link = parse_link(deployed.vault_url)
-    keys = KeySource(KEYS.gateway_key(1))
+    keys = None if deployed.link == "unix" else KeySource(KEYS.gateway_key(1))
     marks = DriftMarks.load(deployed.state)
     pool = UpstreamPool(link, keys, marks, DefinitionStore(deployed.state))
     found = ENTRY_POINTS if entry_points is None else entry_points

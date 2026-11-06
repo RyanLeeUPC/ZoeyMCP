@@ -8,6 +8,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from starlette.types import ASGIApp
@@ -29,6 +30,8 @@ def serve(
     lifespan: bool = False,
     proxy_headers: bool = True,
     tls: tuple[Path, Path] | None = None,
+    uds: Path | None = None,
+    http: Any = None,
 ) -> Iterator[str]:
     """Serve ``app`` on ``127.0.0.1`` and yield its base URL, e.g. ``http://127.0.0.1:53817``.
 
@@ -36,12 +39,17 @@ def serve(
     open at the end are cut after ``SHUTDOWN_GRACE`` seconds. ``proxy_headers=False`` is how
     the gateway runs: uvicorn's default trusts ``X-Forwarded-For`` from loopback. ``tls`` is a
     certificate and key file (``tests/acceptance/tls.py``'s ``issue_cert``): the app is then
-    served over HTTPS, as the fake resolver's dial map reaches it (M7 design BP-1).
+    served over HTTPS, as the fake resolver's dial map reaches it (M7 design BP-1). ``uds`` serves
+    it on that unix socket instead, yielding ``unix:<path>`` as the gateway's link names it, and
+    ``http`` is uvicorn's HTTP protocol class (the link socket's peer check, D-72).
     """
+    where: dict[str, Any] = {"host": "127.0.0.1", "port": 0}
+    if uds is not None:
+        where = {"uds": str(uds)}
     config = uvicorn.Config(
         app,
-        host="127.0.0.1",
-        port=0,
+        **where,
+        **({"http": http} if http is not None else {}),
         log_level="warning",
         lifespan="on" if lifespan else "off",
         proxy_headers=proxy_headers,
@@ -57,9 +65,12 @@ def serve(
         if not thread.is_alive() or time.monotonic() > deadline:
             raise RuntimeError("fake provider failed to start")
         time.sleep(0.01)
-    port = server.servers[0].sockets[0].getsockname()[1]
     try:
-        yield f"{'http' if tls is None else 'https'}://127.0.0.1:{port}"
+        if uds is not None:
+            yield f"unix:{uds}"
+        else:
+            port = server.servers[0].sockets[0].getsockname()[1]
+            yield f"{'http' if tls is None else 'https'}://127.0.0.1:{port}"
     finally:
         server.should_exit = True
         thread.join(STARTUP_TIMEOUT)

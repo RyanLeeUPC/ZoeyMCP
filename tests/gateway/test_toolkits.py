@@ -25,7 +25,7 @@ from mcp.types import CallToolResult, TextContent
 
 from tests.acceptance.tls import ProviderCA, make_ca
 from tests.fakes.agent import ACCEPT, DECLINE, VERSIONS, Script, Version, agent
-from tests.gateway.rig import token_for, until
+from tests.gateway.rig import LINKS, Link, token_for, until
 from tests.gateway.toolkit_rig import (
     ENTRY_POINTS,
     GROUP,
@@ -92,12 +92,13 @@ def url(running: Any, server: str) -> str:
 # --- the mail toolkit (S15) ---------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("link", LINKS)  # D-72: over TCP and the link socket
 @pytest.mark.parametrize("version", VERSIONS)
 async def test_the_message_sent_is_the_message_shown(
-    tmp_path: Path, ca: ProviderCA, version: Version
+    tmp_path: Path, ca: ProviderCA, version: Version, link: Link
 ) -> None:
     script = Script([ACCEPT])
-    with kit(tmp_path, ca) as deployed, toolkit_gateway(deployed) as running:
+    with kit(tmp_path, ca, link=link) as deployed, toolkit_gateway(deployed) as running:
         async with agent(
             url(running, "mail"), version=version, script=script, headers=headers()
         ) as client:
@@ -126,8 +127,9 @@ async def test_the_message_sent_is_the_message_shown(
     assert keys == {f"{ref}.1"}
 
 
-async def test_a_declined_message_sends_nothing(tmp_path: Path, ca: ProviderCA) -> None:
-    with kit(tmp_path, ca) as deployed, toolkit_gateway(deployed) as running:
+@pytest.mark.parametrize("link", LINKS)
+async def test_a_declined_message_sends_nothing(tmp_path: Path, ca: ProviderCA, link: Link) -> None:
+    with kit(tmp_path, ca, link=link) as deployed, toolkit_gateway(deployed) as running:
         async with agent(
             url(running, "mail"), script=Script([DECLINE]), headers=headers()
         ) as client:
@@ -140,10 +142,13 @@ async def test_a_declined_message_sends_nothing(tmp_path: Path, ca: ProviderCA) 
 # --- the records toolkit (S16) ------------------------------------------------------------------
 
 
-async def test_a_batch_is_one_prompt_with_per_item_results(tmp_path: Path, ca: ProviderCA) -> None:
+@pytest.mark.parametrize("link", LINKS)
+async def test_a_batch_is_one_prompt_with_per_item_results(
+    tmp_path: Path, ca: ProviderCA, link: Link
+) -> None:
     script = Script([ACCEPT])
     rows = [{"title": f"t{i}", "amount": i, "day": "2026-01-01"} for i in range(3)]
-    with kit(tmp_path, ca) as deployed, toolkit_gateway(deployed) as running:
+    with kit(tmp_path, ca, link=link) as deployed, toolkit_gateway(deployed) as running:
         async with agent(url(running, "records"), script=script, headers=headers()) as client:
             added = await client.call_tool("add_records", {"records": rows})
             ids = [item["value"] for item in json.loads(text(added))["items"]]

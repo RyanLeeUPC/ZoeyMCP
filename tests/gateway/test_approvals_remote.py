@@ -13,6 +13,10 @@ during an approved call (an elicitation imitating the gateway's prompt on the ca
 the GET stream, then sampling), and a modern ``input_required`` of each kind, never reach the
 agent: it sees the gateway's own prompt alone, and its sampling and roots callbacks are never
 called.
+
+D-72's link axis (the pre-main test-debt pass): the accept, the declines, a timeout, an accepted
+forward the agent leaves and a policy reload during a prompt run over TCP with the gateway key and
+over the link socket with the peer check (the standard tier, Linux only).
 """
 
 from __future__ import annotations
@@ -48,8 +52,10 @@ from tests.fakes.agent import (
 from tests.fakes.mcp_server import Ask, McpFake
 from tests.gateway.rig import (
     CLIENTS,
+    LINKS,
     SERVER,
     Deployed,
+    Link,
     Running,
     deployment,
     gateway,
@@ -83,6 +89,7 @@ def approving(
     approvals: dict[str, dict[str, Any]] | None = None,
     gateway_approvals: dict[str, Any] | None = None,
     era: str = "auto",
+    link: Link = "tcp",
     **more: Any,
 ) -> Iterator[tuple[Deployed, Running]]:
     fake = fake if fake is not None else McpFake()
@@ -96,7 +103,7 @@ def approving(
     }
     if gateway_approvals is not None:
         options["gateway_approvals"] = gateway_approvals
-    with deployment(tmp_path, fake, **options) as deployed, gateway(deployed) as running:
+    with deployment(tmp_path, fake, link=link, **options) as deployed, gateway(deployed) as running:
         yield deployed, running
 
 
@@ -134,10 +141,13 @@ def by_ref(deployed: Deployed, ref: str) -> list[tuple[str, Any]]:
 # --- the happy path, and the plain declines ------------------------------------------------------
 
 
+@pytest.mark.parametrize("link", LINKS)
 @pytest.mark.parametrize("version", VERSIONS)
-async def test_accept_runs_exactly_the_shown_call(tmp_path: Path, version: Version) -> None:
+async def test_accept_runs_exactly_the_shown_call(
+    tmp_path: Path, version: Version, link: Link
+) -> None:
     script = Script([ACCEPT])
-    with approving(tmp_path) as (deployed, running):
+    with approving(tmp_path, link=link) as (deployed, running):
         async with agent(
             running.mcp(), version=version, script=script, headers=headers()
         ) as client:
@@ -182,12 +192,13 @@ async def test_a_prompt_that_crosses_midnight_utc_shows_the_date(tmp_path: Path)
     ]
 
 
+@pytest.mark.parametrize("link", LINKS)
 @pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize(("answer", "decision"), [(DECLINE, "decline"), (CANCEL, "dismiss")])
 async def test_a_decline_sends_nothing(
-    tmp_path: Path, version: Version, answer: Answer, decision: str
+    tmp_path: Path, version: Version, answer: Answer, decision: str, link: Link
 ) -> None:
-    with approving(tmp_path) as (deployed, running):
+    with approving(tmp_path, link=link) as (deployed, running):
         async with agent(
             running.mcp(), version=version, script=Script([answer]), headers=headers()
         ) as client:
@@ -338,11 +349,12 @@ async def test_a_decline_starts_a_cooldown(tmp_path: Path, version: Version) -> 
 # --- timeouts and failing clients ---------------------------------------------------------------
 
 
+@pytest.mark.parametrize("link", LINKS)
 @pytest.mark.parametrize("version", ["2025-11-25", "2025-06-18"])
-async def test_a_legacy_prompt_times_out(tmp_path: Path, version: Version) -> None:
+async def test_a_legacy_prompt_times_out(tmp_path: Path, version: Version, link: Link) -> None:
     quick = {CLIENTS[0]: {"attended": True, "timeout": 1}}
     script = Script([Answer(delay=3.0)])
-    with approving(tmp_path, approvals=quick) as (deployed, running):
+    with approving(tmp_path, approvals=quick, link=link) as (deployed, running):
         async with agent(
             running.mcp(), version=version, script=script, headers=headers()
         ) as client:
@@ -500,12 +512,13 @@ async def test_a_handle_on_an_allow_tool_is_refused(tmp_path: Path) -> None:
 # --- committed calls finish ---------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("link", LINKS)
 @pytest.mark.parametrize("version", VERSIONS)
 async def test_the_agent_leaving_during_an_accepted_forward_doesnt_stop_it(
-    tmp_path: Path, version: Version
+    tmp_path: Path, version: Version, link: Link
 ) -> None:
     script = Script([ACCEPT])
-    with approving(tmp_path) as (deployed, running):
+    with approving(tmp_path, link=link) as (deployed, running):
         async with agent(
             running.mcp(), version=version, script=script, headers=headers()
         ) as client:
@@ -661,9 +674,10 @@ async def test_an_answer_on_another_session_is_refused(tmp_path: Path) -> None:
     assert deployed.fake.calls == []
 
 
-async def test_unassigning_the_client_withdraws_its_prompt(tmp_path: Path) -> None:
+@pytest.mark.parametrize("link", LINKS)
+async def test_unassigning_the_client_withdraws_its_prompt(tmp_path: Path, link: Link) -> None:
     script = Script([Answer(delay=8.0)])
-    with approving(tmp_path) as (deployed, running):
+    with approving(tmp_path, link=link) as (deployed, running):
         async with agent(
             running.mcp(), version="2025-11-25", script=script, headers=headers()
         ) as client:

@@ -1,7 +1,8 @@
 """A real vault in front of the fake MCP server, and the gateway's upstream pool on it.
 
 The fake and the vault each run on a uvicorn thread. The pool runs in the test's event loop and
-reaches the vault over TCP with the gateway key, as the hardened tier does.
+reaches the vault over TCP with the gateway key, as the hardened tier does, or with ``link="unix"``
+over the link socket with the peer check and no key, as the standard tier does (D-72; Linux only).
 """
 
 from __future__ import annotations
@@ -10,16 +11,19 @@ import asyncio
 import copy
 import io
 import json
+import os
+import sys
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 import httpx
 import httpx2
+import pytest
 from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool
@@ -52,13 +56,22 @@ from zoeymcp.vault.admin import SetupCodes
 from zoeymcp.vault.app import VaultApp
 from zoeymcp.vault.bindings import derive_binding
 from zoeymcp.vault.keys import KeySet
+from zoeymcp.vault.peer import peer_checked
 from zoeymcp.vault.reportstore import ReportStore
+from zoeymcp.vault.server import ListenerTag
 from zoeymcp.vault.store import SecretStore
 
 KEYS = KeySet.from_master(bytes(range(64, 96)))
 SERVER = "notes"
 CLIENTS = ("agent1", "agent2")
 LIMITS = GatewayLimits()
+
+Link = Literal["tcp", "unix"]
+# The two links, for ``pytest.mark.parametrize("link", LINKS)``: the link socket's peer check reads
+# SO_PEERCRED, so the unix link runs on Linux only.
+LINKS = ["tcp", pytest.param("unix", marks=pytest.mark.skipif(
+    sys.platform != "linux", reason="the link socket's peer check is Linux only"
+))]  # fmt: skip
 
 
 def pin_of_fake(fake: McpFake, name: str, *, session: str | None = None, listing: int = 1) -> str:
@@ -185,6 +198,16 @@ class Deployed:
     options: dict[str, Any] = field(default_factory=dict)
     # The vault app, for what it keeps in memory (the gateway's status report, M6 design K.1).
     vault: VaultApp | None = None
+    link: Link = "tcp"
+
+    @property
+    def keys(self) -> KeySource | None:
+        """The gateway's key on TCP; none on the link socket, where the vault refuses one."""
+        return None if self.link == "unix" else KeySource(KEYS.gateway_key(1))
+
+    def vault_http(self) -> httpx.Client:
+        """A client for the vault's test-only paths, over whichever link it is served on."""
+        return vault_http(self.vault_url)
 
     @property
     def server(self) -> ViewRemoteServer:
@@ -210,7 +233,8 @@ class Deployed:
         """Reload the running vault with ``raw_policy`` options changed, as SIGHUP would."""
         self.options = {**self.options, **options}
         raw = raw_policy(self.fake_url, **self.options)
-        answer = httpx.post(self.vault_url + RELOAD_PATH, json=raw, timeout=10)
+        with self.vault_http() as http:
+            answer = http.post(RELOAD_PATH, json=raw)
         assert answer.status_code == 204, answer.text
         self.policy = Policy.model_validate(raw)
         self.view = build_view(self.policy)
@@ -255,8 +279,10 @@ class Reloadable:
 
 @contextmanager
 def deployment(tmp_path: Path, fake: McpFake, **options: Any) -> Iterator[Deployed]:
-    """The fake, and a real vault routing ``/notes`` to it for the gateway only."""
-    with deployment_with(tmp_path, fake, options) as deployed:
+    """The fake, and a real vault routing ``/notes`` to it for the gateway only; ``link`` (an
+    option beside ``raw_policy``'s, ``"tcp"`` unless given) is the gateway's link to the vault."""
+    link: Link = options.pop("link", "tcp")
+    with deployment_with(tmp_path, fake, options, link=link) as deployed:
         yield deployed
 
 
@@ -269,10 +295,11 @@ def deployment_with(
     reports: ReportStore | None = None,
     wrap: Callable[[ASGIApp], ASGIApp] | None = None,
     vault: dict[str, Any] | None = None,
+    link: Link = "tcp",
 ) -> Iterator[Deployed]:
-    """:func:`deployment` with ``raw_policy`` ``options``, where ``reports`` is the vault's copy
-    of the gateway's ledger (the report path answers 503 without one), ``wrap`` wraps the
-    vault's app, for a test that changes how it answers, and ``vault`` adds arguments to the
+    """:func:`deployment` with ``raw_policy`` ``options`` over ``link``, where ``reports`` is the
+    vault's copy of the gateway's ledger (the report path answers 503 without one), ``wrap`` wraps
+    the vault's app, for a test that changes how it answers, and ``vault`` adds arguments to the
     vault's app (M8: its chain, approver hub and hold clock)."""
     log = io.StringIO()
     logs.set_stream(log)
@@ -289,6 +316,7 @@ def deployment_with(
                 client=httpx.AsyncClient(),
                 environ={},
                 reports=reports,
+                gateway_link=link == "unix",
                 **(vault or {}),
             )
             setup = SetupCodes(tmp_path / "vault", KEYS.portal_key)
@@ -301,7 +329,8 @@ def deployment_with(
                 gateway_status=app.gateway_status,
             )
             served: ASGIApp = Reloadable(app, admin.app)
-            with serve(wrap(served) if wrap is not None else served) as vault_url:
+            served = wrap(served) if wrap is not None else served
+            with serve_vault(served, tmp_path, link) as vault_url:
                 yield Deployed(
                     fake,
                     vault_url,
@@ -312,9 +341,38 @@ def deployment_with(
                     fake_url=fake_url,
                     options=options,
                     vault=app,
+                    link=link,
                 )
     finally:
         logs.set_stream(None)
+
+
+def vault_http(vault_url: str) -> httpx.Client:
+    """A client for the vault at ``vault_url``, a TCP base URL or the link socket's ``unix:``."""
+    if vault_url.startswith("unix:"):
+        uds = vault_url.removeprefix("unix:")
+        return httpx.Client(
+            transport=httpx.HTTPTransport(uds=uds), base_url="http://vault", timeout=10
+        )
+    return httpx.Client(base_url=vault_url, timeout=10)
+
+
+@contextmanager
+def serve_vault(app: ASGIApp, tmp_path: Path, link: Link) -> Iterator[str]:
+    """The vault on TCP, or on the link socket with the peer check, tagged as the gateway's
+    listener as ``zoeymcp vault`` tags it; yields the gateway's link to it."""
+    if link == "tcp":
+        with serve(app) as url:
+            yield url
+        return
+    socket = tmp_path / "link" / "vault.sock"
+    socket.parent.mkdir(mode=0o700)
+    tagged = ListenerTag(app, "gateway")
+    uid = 0
+    if sys.platform != "win32":
+        uid = os.getuid()
+    with serve(tagged, uds=socket, http=peer_checked(uid)) as url:
+        yield url
 
 
 @asynccontextmanager
@@ -324,7 +382,7 @@ async def pool_for(
     """The gateway's upstream pool on the deployment's vault, running until the block ends."""
     pool = UpstreamPool(
         parse_link(deployed.vault_url),
-        KeySource(KEYS.gateway_key(1)),
+        deployed.keys,
         DriftMarks.load(deployed.state),
         DefinitionStore(deployed.state),
         limits=deployed.view.gateway.limits,
@@ -435,12 +493,12 @@ def gateway(
     as ``zoeymcp gateway`` does; its restore witness is the deployment's state's (K.3)."""
     pool = UpstreamPool(
         parse_link(deployed.vault_url),
-        KeySource(KEYS.gateway_key(1)),
+        deployed.keys,
         DriftMarks.load(deployed.state),
         DefinitionStore(deployed.state),
         limits=deployed.view.gateway.limits,
     )
-    link, keys = parse_link(deployed.vault_url), KeySource(KEYS.gateway_key(1))
+    link, keys = parse_link(deployed.vault_url), deployed.keys
     reporting = report_client(link, keys) if report else None
     reviewing = review_client(link, keys) if review else None
     app = GatewayApp(
