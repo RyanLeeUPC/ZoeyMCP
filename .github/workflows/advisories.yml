@@ -30,3 +30,27 @@ jobs:
         with:
           scan-args: |-
             --lockfile=uv.lock
+
+  # The lock's staleness reminder (D-96, fold-in Q18 (a)): fails once exclude-newer is more than
+  # 21 days old, so the lock is moved forward (README, "Updating the lock"). Not on a push: dev's
+  # date is moved right before each release, and the weekly schedule runs once this is on main.
+  lock-age:
+    name: exclude-newer is recent
+    if: github.event_name != 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fail once exclude-newer is more than 21 days old
+        run: |
+          set -euo pipefail
+          day="$(sed -n 's/^exclude-newer = "\([0-9-]*\)T00:00:00Z"$/\1/p' pyproject.toml)"
+          test -n "$day"
+          age=$(( ($(date -u +%s) - $(date -u -d "$day" +%s)) / 86400 ))
+          echo "exclude-newer is $day, $age days ago"
+          if [ "$age" -gt 21 ]; then
+            echo "::error::exclude-newer ($day) is $age days old: update the lock (README, Updating the lock)"
+            exit 1
+          fi

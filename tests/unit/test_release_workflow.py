@@ -240,6 +240,19 @@ def test_there_are_the_workflows_and_the_action() -> None:
     assert ACTION.is_file()
 
 
+def test_the_lock_age_reminder_reads_pyprojects_date() -> None:
+    """D-96: the reminder's sed finds exclude-newer in the form pyproject.toml writes it, and
+    runs on the schedule and by hand, never on a push."""
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.findall(r'^exclude-newer = "([0-9-]*)T00:00:00Z"$', pyproject, re.MULTILINE)
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "advisories.yml").read_text())
+    job = workflow["jobs"]["lock-age"]
+    assert job["if"] == "github.event_name != 'push'"
+    assert "-gt 21" in job["steps"][-1]["run"]
+    # PyYAML reads the key on: as True.
+    assert set(workflow[True]) == {"push", "schedule", "workflow_dispatch"}
+
+
 @pytest.mark.parametrize("path", [*WORKFLOWS, ACTION], ids=lambda path: path.name)
 def test_every_checkout_keeps_no_credentials(path: Path) -> None:
     for step in steps_of(path):

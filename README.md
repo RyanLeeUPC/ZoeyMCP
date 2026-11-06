@@ -249,8 +249,8 @@ uv sync --locked --all-extras --group browser    # the gateway's extra and Playw
 uv run pytest                                    # tests, including property tests
 ZOEYMCP_BROWSER=chrome uv run pytest tests/browser/test_session.py::<test>  # one, in Chrome
 # lint, then format, the paths CI lints
-uv run ruff check src tests examples/toolkits examples/bridge .github/actions/build-image
-uv run ruff format src tests examples/toolkits examples/bridge .github/actions/build-image
+uv run ruff check src tests examples/toolkits examples/bridge scripts .github/actions/build-image
+uv run ruff format src tests examples/toolkits examples/bridge scripts .github/actions/build-image
 uv run mypy                                      # strict type checks
 uv run zoeymcp check --config examples/policy.yaml
 ```
@@ -265,6 +265,22 @@ or `msedge`), a by-hand browser checklist for what those can't check
 deployment tiers (`scripts/smoke-image.sh`), and mutation testing of the security-critical
 modules in CI (`.github/workflows/mutation.yml`, gated at 95% overall and at a floor for each
 module, listed in `pyproject.toml`).
+
+### Updating the lock
+
+There is no Dependabot for Python: the cooldown is `exclude-newer`. The advisories workflow scans
+`uv.lock` on every push to `dev`, and once a week fails a job when `exclude-newer` is more than 21
+days old. The lock is also updated right before each release.
+
+1. Move `exclude-newer` in `pyproject.toml` to about two weeks before today, and delete each
+   `exclude-newer-package` exception the new date passes (its comment says why it was added).
+2. Run `uv lock --upgrade`, then read `git diff uv.lock`: a new package, or one that changed
+   source or lost its wheels, needs a reason.
+3. `mcp` and `mcp-types` are pinned exactly, so a relock leaves them alone. Moving them has a
+   procedure of its own: it re-runs the SDK contract tests (`tests/sdk`), the golden pins and the
+   two SDK-behaviour strict xfails, which flip on an SDK change (register D-95, design.md §12.3).
+4. Push to `dev`. CI runs every automated test on the new lock, and the advisories workflow
+   scans it. A package with an advisory gets an `exclude-newer-package` exception and a relock.
 
 ## License
 
