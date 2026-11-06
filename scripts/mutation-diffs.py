@@ -11,7 +11,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from mutmut.__main__ import (  # mutmut 3.8's own helpers: the CI job pins the version
+# mutmut 3.8's own helpers, which it doesn't re-export: the CI job pins the version.
+from mutmut.__main__ import (  # type: ignore[attr-defined]
     SourceFileMutationData,
     get_diff_for_mutant,
     status_by_exit_code,

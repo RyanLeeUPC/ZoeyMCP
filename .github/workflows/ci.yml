@@ -32,11 +32,34 @@ jobs:
       # The build action's oci.py too, which the release dry run and release.yml's publish run.
       - run: >-
           uv run --locked ruff check
-          src tests examples/toolkits examples/bridge .github/actions/build-image
+          src tests examples/toolkits examples/bridge scripts .github/actions/build-image
       - run: >-
           uv run --locked ruff format --check
-          src tests examples/toolkits examples/bridge .github/actions/build-image
+          src tests examples/toolkits examples/bridge scripts .github/actions/build-image
       - run: uv run --locked mypy
+      # Shell scripts and workflows (register D-97). Release binaries pinned by SHA-256 (GitHub's
+      # own asset digests); actionlint also runs shellcheck over every `run:` block it finds.
+      - name: shellcheck and actionlint
+        env:
+          SHELLCHECK_VERSION: "0.11.0"
+          SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/lint-bin"
+          mkdir -p "$bin"
+          cd "$RUNNER_TEMP"
+          sc="shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          al="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSLo "$sc" "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/$sc"
+          curl -fsSLo "$al" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$al"
+          printf '%s  %s\n%s  %s\n' "$SHELLCHECK_SHA256" "$sc" "$ACTIONLINT_SHA256" "$al" | sha256sum -c -
+          tar -xzf "$sc" --strip-components=1 -C "$bin" "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+          tar -xzf "$al" -C "$bin" actionlint
+          cd "$GITHUB_WORKSPACE"
+          git ls-files -z '*.sh' | xargs -0 "$bin/shellcheck"
+          PATH="$bin:$PATH" "$bin/actionlint"
 
   test:
     name: tests (Python ${{ matrix.python }})

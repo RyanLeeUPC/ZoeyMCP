@@ -101,6 +101,7 @@ files = [
     "examples/bridge/server/src",
     "examples/bridge/server/tests",
     ".github/actions/build-image",
+    "scripts",
 ]
 mypy_path = ["examples/toolkits/src", "examples/bridge/server/src"]
 plugins = ["pydantic.mypy"]

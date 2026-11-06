@@ -1425,13 +1425,31 @@ entry points, never from a path its uid can write, and never in the vault's envi
 ```python
 toolkit = Toolkit("mail", slots={"mail": "smtp"})
 
+
 async def plan_send(ctx: PrepareContext, subject: str, body: str) -> Plan:
-    config = await ctx.vault("mail").get_object("/config")      # connector config only
-    request = {"expect_from": config["from"], "expect_to": config["to"],
-               "subject": subject, "body": body}
-    return Plan("Send an email", [Write.post("/send", request, show=[
-        Show.line("From", "/expect_from"), Show.line("To", "/expect_to"),
-        Show.line("Subject", "/subject"), Show.block("/body")])])
+    config = await ctx.vault("mail").get_object("/config")  # connector config only
+    request = {
+        "expect_from": config["from"],
+        "expect_to": config["to"],
+        "subject": subject,
+        "body": body,
+    }
+    return Plan(
+        "Send an email",
+        [
+            Write.post(
+                "/send",
+                request,
+                show=[
+                    Show.line("From", "/expect_from"),
+                    Show.line("To", "/expect_to"),
+                    Show.line("Subject", "/subject"),
+                    Show.block("/body"),
+                ],
+            )
+        ],
+    )
+
 
 @toolkit.tool(consequential=True, prepare=plan_send)
 async def send_note(ctx: ToolContext, subject: Subject, body: Body) -> str:
