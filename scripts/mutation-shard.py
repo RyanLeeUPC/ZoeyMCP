@@ -25,7 +25,10 @@ DIGITS = "0123456789"
 DEFAULT_WEIGHT = 100
 # Seconds of test time across each module's mutants, and per last digit of the mutant number for
 # the modules with at least 1% of the total, measured in CI on 7dff31d (44,584 mutants). There a
-# shard's job took about 7 minutes plus 0.358 of its weight (r = 0.93 over the 16 shards).
+# shard's job took about 7 minutes plus 0.358 of its weight (r = 0.93 over the 16 shards);
+# predicted_seconds uses that fit, and mutation.yml's 25-minute rule applies to it.
+JOB_OVERHEAD_SECONDS = 421
+JOB_SECONDS_PER_WEIGHT = 0.358
 WEIGHTS: dict[str, int] = {
     "zoeymcp.common.policy.check": 13514,
     "zoeymcp.vault.oauth.tokens": 2612,
@@ -216,6 +219,11 @@ def shards(names: list[str], count: int) -> list[list[Part]]:
             ]
         )
     return merged
+
+
+def predicted_seconds(group: list[Part]) -> float:
+    """A shard's job time on an average runner, from its parts' weights."""
+    return JOB_OVERHEAD_SECONDS + JOB_SECONDS_PER_WEIGHT * sum(part.weight for part in group)
 
 
 def main() -> int:

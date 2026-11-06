@@ -107,8 +107,11 @@ def test_the_workflows_shards_are_balanced() -> None:
     job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["shard"]
     count = job["env"]["SHARDS"]
     assert job["strategy"]["matrix"]["shard"] == list(range(count))
-    loads = [sum(part.weight for part in group) for group in shard.shards(shard.modules(), count)]
+    groups = shard.shards(shard.modules(), count)
+    loads = [sum(part.weight for part in group) for group in groups]
     assert max(loads) < 1.05 * min(loads)
+    # The shard-count rule (D-226): the slowest shard's predicted time stays under 25 minutes.
+    assert max(shard.predicted_seconds(group) for group in groups) < 25 * 60
 
 
 def test_the_cli_prints_patterns(
