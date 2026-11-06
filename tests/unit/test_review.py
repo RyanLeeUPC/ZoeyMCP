@@ -542,7 +542,7 @@ def test_the_summary_exits_as_review_server_does(include: list[str], expected: i
     invalid or duplicate needs the operator only when it is included; the line counts it
     either way."""
     server = policy(include, {name: pin(name) for name in include})
-    tools = [tool("a"), tool("bad", "Hidden​ text."), tool("twice"), tool("twice", "Again.")]
+    tools = [tool("a"), tool("bad", "Hidden\u200b text."), tool("twice"), tool("twice", "Again.")]
     assert view.exit_code(reviewed(tools, server)) == expected
     lines, code = view.summary(status(notes=status_entry(tools, server)))
     assert code == expected
